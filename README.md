@@ -1,20 +1,48 @@
 # moe-on-a-desk
 
-Fast single-stream decoding of **Qwen3.8-Flash-Next 125B** (MoE, 512 experts, top-10) on one **Mac Studio M4 Max 64 GB**,
-with exact speculative decoding. The quantization is not changed (IQ3_XXS GSQ-RCO, the same file as the baseline, fully
-GPU resident); all gains come from new code in a llama.cpp fork, published here as a patch series.
+**巨大な MoE モデルを、机の上のコンシューマ機で、量子化を落とさずにどこまで速く動かせるか。**
+この 1 台の Mac Studio で得た結果と、そのためのコード(llama.cpp フォークのパッチ)をすべて公開しています。
+まだ 1 台でしか試しておらず、推論精度の確認も軽いものです。お手元の環境での結果、品質の検証、改良を、Issue や PR で
+ぜひ寄せてください。ローカルで動く AI を、コンシューマ向けの PC 環境でみんなで作っていきましょう。
 
-- `mac125b/CONCLUSIONS.md` — what was built, why, and what it gave (conclusions only; read this first)
-- `mac125b/DESIGN.md` — the full research log in Japanese (every measurement and trial, including refuted ideas)
-- `AGENTS.md` — the working rules of the project (goal, fixed baselines and metric, what counts as a result)
+*How fast can a huge MoE model run on a consumer machine on your desk, without lowering its quantization?* This repository
+publishes everything we built for one Mac Studio: the results, the llama.cpp fork as patches, and the full research log.
+It has been tested on **one machine only**, and output quality has only been checked lightly — **reports from other
+machines, quality evaluations, issues and PRs are very welcome** (see [Help wanted](#help-wanted)).
+
+---
+
+## What this is
+
+Single-stream decoding of **Qwen3.8-Flash-Next 125B** (MoE, 512 experts, top-10, ~6B active) with exact speculative
+decoding (the model's own MTP draft head; the target verifies every token). The quantization is not changed — the same
+IQ3_XXS GSQ-RCO file as the baseline, fully GPU resident — and all gains come from new code.
+
+- `mac125b/CONCLUSIONS.md` — what was built, why, and what it gave (read this first)
+- `mac125b/DESIGN.md` — the full research log in Japanese: every measurement and trial, including the ideas that failed
+- `AGENTS.md` — the rules the project follows (fixed baselines and metric, what counts as a result, no cheating)
 - `mac125b/patches/` — the fork as `git format-patch` output on upstream llama.cpp `781dbc5`
-- `mac125b/tools/` — measurement, verification, kernel micro-benchmarks, analysis, MTP training, comparison console
+- `mac125b/tools/` — measurement, verification, kernel micro-benchmarks, analysis, MTP training, a comparison console
+
+## Tested on (the only machine so far)
+
+| | |
+|---|---|
+| Machine | Mac Studio (Mac16,9), Apple **M4 Max** |
+| CPU / GPU | 16 cores (12 performance + 4 efficiency) / **40-core GPU**, Metal 4 |
+| Memory | **64 GB** unified, 546 GB/s; the GPU working-set limit is about 55.7 GB |
+| Storage | 2 TB internal SSD (the model's 27.5 GB n-gram table is read from it through mmap) |
+| OS / tools | macOS 27.0.1, Xcode command line tools, CMake 3.29 |
+| Power / clocks | default settings; the GPU stays at its top P-state (1578 MHz) during decode |
+
+Nothing else has been measured. Other chips (M1–M5, Pro/Max/Ultra), other memory sizes (32 / 48 / 96 / 128 GB and up)
+and other OS versions may behave differently — the kernels were tuned on this GPU, and some thresholds were chosen for it.
 
 ## Result
 
-Fixed metric (`mac125b/tools/measure/mtpab.sh`): same Mac, thinking off, MTP draft head on, decode tok/s from the
-llama-server `timings`; bench = `bench-strata.py --lengths 1024,4096 --max-tokens 256 --repeat 3`; code / prose = greedy
-400 tokens on one fixed prompt each. The two comparison rows were measured once and are fixed (never re-measured).
+Fixed metric (`mac125b/tools/measure/mtpab.sh`): thinking off, MTP on, decode tok/s from the llama-server `timings`.
+bench = `bench-strata.py --lengths 1024,4096 --max-tokens 256 --repeat 3`; code / prose = greedy 400 tokens on one
+fixed prompt each. The two comparison rows were measured once on the same machine and are kept fixed.
 
 | | quantization | bench 1K | bench 4K | code 400 | prose 400 |
 |---|---|---:|---:|---:|---:|
@@ -25,21 +53,46 @@ llama-server `timings`; bench = `bench-strata.py --lengths 1024,4096 --max-token
 | this work `-11e` (mean of 2 runs) | same | 115.8 | 106.6 | 111.2 | 69.7 |
 | **this work `-11f`** (mean of 2 runs) | same | **125.8** | **109.7** | **110.3** | **70.9** |
 
-`-11f` is +64 / +46 / +44 / +47 % over the start. Generality check on 18 held-out prompts (code, poems, reviews; never
-used for tuning): start 60.2 → `-11d` 74.5 tok/s; `-11e` +6.3 % over `-11d` and `-11f` +2.2 % over `-11e` (each pair
-measured in one session). Reference only, different quantization and engine: TensorFold 0.6.6 with MLX 4-bit on the
-same Mac (does not fit in 64 GB, streams experts from SSD) 52.6 / 56.8 / 24.0 / 28.9.
+`-11f` is +64 / +46 / +44 / +47 % over the start. On 18 held-out prompts (code, poems, reviews; never used for tuning):
+start 60.2 → `-11d` 74.5 tok/s; `-11e` +6.3 % over `-11d`, `-11f` +2.2 % over `-11e`. Reference only (different
+quantization and engine): TensorFold 0.6.6 with MLX 4-bit on the same Mac (streams experts from SSD) 52.6 / 56.8 / 24.0 / 28.9.
 
-The main mechanisms (details and measured effect of each in `CONCLUSIONS.md` §2): spin wait on GPU completion,
-launch-shape fixes, a coarse q1_0 draft head with exact top-32 re-scoring, bounded rollback snapshots, a graph cache per
-small-batch shape, delayed frees in the graph allocator, MTP catch-up merged into the first draft step, few-token MoE and
-bf16 kernels, a graph reorder and ~10 small-op fusions for the hybrid model (bit-identical), skipping the QSA indexer below
-its selection budget, and a **per-draft stop rule** that predicts acceptance from the draft head's own confidence
-(held-out AUC 0.888) and drafts only while the expected gain beats the measured cost.
+Main mechanisms (each with its measured effect in `CONCLUSIONS.md` §2): spin wait on GPU completion, launch-shape fixes,
+a coarse q1_0 draft head with exact top-32 re-scoring, bounded rollback snapshots, a graph cache per small-batch shape,
+delayed frees in the graph allocator, MTP catch-up merged into the first draft step, few-token MoE and bf16 kernels, a
+graph reorder and ~10 small-op fusions for the hybrid model (bit-identical), exact shortcuts in the QSA sparse attention,
+and a **per-draft stop rule** that predicts acceptance from the draft head's own confidence (held-out AUC 0.888) and
+drafts only while the expected gain beats the measured cost.
+
+## How much the output quality has been checked (honestly: lightly)
+
+Checked:
+- greedy output of the plain decode path (B = 1, 200 tokens) is byte-identical to the unmodified build;
+- perplexity equals the unmodified build on our held-out text (c = 512 with ubatch 512 and 64, and c = 6144 where the
+  sparse-attention selection is active);
+- the code answer of the fixed metric is identical across all checkpoints.
+
+Not checked yet:
+- standard benchmarks (MMLU-style, HumanEval-style, long-context retrieval, multilingual, tool use);
+- thinking on, sampling with temperature > 0, very long generations, contexts beyond 16k;
+- the effect of the verify width: llama.cpp kernels are not batch-invariant, so every speculative configuration
+  (including the unmodified start) diverges from one-token-at-a-time greedy decoding after a few hundred characters on
+  near-tie tokens. We believe this is harmless, but it has not been measured on a benchmark.
+
+## Help wanted
+
+This was done by one person and an AI agent on one Mac. Things that would help most:
+
+1. **Results from other machines** — open an issue with: machine / chip / GPU cores / memory / macOS, the model files,
+   the exact command, and the output of `mtpab.sh` (or simply tok/s from `llama-server` timings), start build vs. this fork.
+2. **Quality evaluations** — any benchmark comparing the unmodified build and this fork on the same quantization.
+3. **Bugs** — wrong outputs, crashes, memory errors (please include the perplexity check below; it caught one of ours).
+4. **PRs** — ports of the ideas to other models or backends, better kernels, better drafting, cleaner code.
+   Upstreaming useful parts to llama.cpp is welcome too.
+
+Local AI on consumer hardware gets better when many people try it on many machines. Let's build it together.
 
 ## Reproduce
-
-Hardware / software used: Mac Studio M4 Max 64 GB (40-core GPU), macOS 27.0.1, Xcode command line tools, CMake 3.29.
 
 Models (not included; obtain them from their publishers):
 - target: ISTA-DASLab Qwen3.8-Flash-Next GSQ-RCO **IQ3_XXS** GGUF, 2 shards
@@ -67,14 +120,14 @@ GGML_ALLOC_FREE_DELAY=4 LLAMA_SPEC_MTP_MERGE=1 LLAMA_GRAPH_CACHE=16 LLAMA_SPEC_S
   -ngl 99 -c 16384 -np 1 --host 127.0.0.1 --port 8080
 ```
 
-Measure: `mac125b/tools/measure/mtpab.sh "name:ENV=VAL ...|extra server args"` (edit the model paths at the top; it starts and
-stops the server itself and writes the answers next to the timings). Single code/prose runs swing by up to ±10 %; use the
+Measure: `mac125b/tools/measure/mtpab.sh "name:ENV=VAL ...|extra server args"` (edit the model paths at the top; it starts
+and stops the server and saves the answers next to the timings). Single code / prose runs swing by up to ±10 %; use the
 mean of at least two runs.
 
 Verify before trusting a build:
-1. greedy B=1 output byte-identical to the unmodified build (`tools/measure/verify.sh`-style md5 of 200 tokens);
+1. greedy B = 1 output byte-identical to the unmodified build (`mac125b/tools/measure/verify.sh`, md5 of 200 tokens);
 2. `llama-perplexity -c 512 -b 512 -ub 512` and `-ub 64` **without** `GGML_ALLOC_FREE_DELAY` give the same PPL as the
-   unmodified build (catches large-batch bugs that the decode path never exercises).
+   unmodified build (this catches large-batch bugs that the decode path never exercises).
 
 ### Switches (environment variables of the fork)
 
@@ -94,26 +147,21 @@ Verify before trusting a build:
 
 ## Caveats
 
-- **Exactness.** The target model verifies every drafted token, so the output is the target's greedy output up to
-  numerics: llama.cpp kernels are not batch-invariant, and a different verify width can flip a near-tie, so every
-  speculative configuration (including the unmodified start) diverges from one-token-at-a-time greedy decoding after a few
-  hundred characters. The code text of the fixed metric is identical across all checkpoints; the prose text changes with
-  the drafting policy. Perplexity equals the unmodified build.
+- **One machine, one model, Metal only.** The CUDA / CPU paths of the fork are upstream's and were only built, not tuned.
 - **Fixed bug.** Checkpoints `-11b` to `-11e` contain a fusion that corrupts prompt batches of ≥ 64 tokens when
-  `GGML_ALLOC_FREE_DELAY` is not set (PPL 1.23 → 253 at ubatch 512). Every configuration measured here sets it, so the numbers
-  stand, but use `-11f` or later (fixed).
+  `GGML_ALLOC_FREE_DELAY` is not set (PPL 1.23 → 253 at ubatch 512). Every configuration measured here sets it, so the
+  numbers stand, but use `-11f` or later.
 - **Comparisons.** Sushi uses a lower-bit quantization (2.6 bpw experts) and its own engine; TensorFold rows are reference
-  only (different quantization). Thinking is off for every engine. The stop rule was fitted on 48 separate training prompts;
-  the fixed-metric prompts and the held-out set were never used for fitting.
+  only (different quantization). Thinking is off for every engine. The stop rule was fitted on 48 separate training
+  prompts; the fixed-metric prompts and the held-out set were never used for fitting.
 - **Cold pages.** The 27.5 GB n-gram table is read through mmap on the CPU; on a 64 GB machine cold rows cost up to
-  4-5 ms per verify. The fixed metric repeats its prompts and sees warm pages.
-- One machine, one model. Metal only (the CUDA/CPU paths of the fork are upstream's, untested beyond building).
+  4-5 ms per verify. The fixed metric repeats its prompts and sees warm pages; a first-time text can be slower.
 
-## In progress (not part of the results above)
+## What's next
 
-The project goal is 3x the start and, next, quantized GLM-5.3 (Q2-Q3) on Mac Studio / RTX 4090-class machines. Current
-experiments: a same-model low-bit copy as a remote drafter on a PC GPU while the Mac only verifies (`DESIGN.md` §10,
-`mac125b/tools/remote-draft/`). Results will be reported here when measured, against baselines on the same hardware.
+- 3x the start on this Mac (the project goal) — the ceiling analysis is in `CONCLUSIONS.md` §4.
+- **GLM-5.3-Flash** (320B MoE, Q2-Q3) on a 64 GB Mac and an RTX 4090-class PC, including using both machines together.
+  Baselines on the same hardware first; results will appear here.
 
 ## License
 
