@@ -47,15 +47,17 @@ fixed prompt each. The two comparison rows were measured once on the same machin
 | | quantization | bench 1K | bench 4K | code 400 | prose 400 |
 |---|---|---:|---:|---:|---:|
 | llama.cpp 781dbc5, unmodified, MTP depth 3 (start) | IQ3_XXS + MTP Q8_0 | 76.8 | 75.3 | 76.6 | 48.3 |
-| Sushi 1.2.1 (MLX-based) | Sushi-2.6bpw (lower bits) | 85.5 | 83.9 | 90.6 | 62.0 |
+| Sushi 1.2.1 (MLX-based) | Sushi-2.6bpw (its own quantization) | 85.5 | 83.9 | 90.6 | 62.0 |
 | this work `mac125b-best-2026-10-11` | IQ3_XXS + MTP Q8_0 | 94.8 | 93.2 | 99.9 | 60.7 |
 | this work `-11d` (mean of 2 runs) | same | 98.4 | 98.8 | 107.0 | 65.9 |
 | this work `-11e` (mean of 2 runs) | same | 115.8 | 106.6 | 111.2 | 69.7 |
 | **this work `-11f`** (mean of 2 runs) | same | **125.8** | **109.7** | **110.3** | **70.9** |
 
-`-11f` is +64 / +46 / +44 / +47 % over the start. On 18 held-out prompts (code, poems, reviews; never used for tuning):
-start 60.2 → `-11d` 74.5 tok/s; `-11e` +6.3 % over `-11d`, `-11f` +2.2 % over `-11e`. Reference only (different
-quantization and engine): TensorFold 0.6.6 with MLX 4-bit on the same Mac (streams experts from SSD) 52.6 / 56.8 / 24.0 / 28.9.
+`-11f` is +64 / +46 / +44 / +47 % over the start. The other engines are listed as reference points on the same machine,
+not as a ranking: each makes different trade-offs (quantization, memory footprint, features), and we learned a lot from them. On 18 held-out prompts (code, poems, reviews; never used for tuning):
+start 60.2 → `-11d` 74.5 tok/s; `-11e` +6.3 % over `-11d`, `-11f` +2.2 % over `-11e`. For context, TensorFold 0.6.6
+runs the model's MLX 4-bit build on the same Mac by streaming experts from SSD — a capability for models larger than memory
+that this setup does not have — at 52.6 / 56.8 / 24.0 / 28.9.
 
 Main mechanisms (each with its measured effect in `CONCLUSIONS.md` §2): spin wait on GPU completion, launch-shape fixes,
 a coarse q1_0 draft head with exact top-32 re-scoring, bounded rollback snapshots, a graph cache per small-batch shape,
@@ -151,8 +153,8 @@ Verify before trusting a build:
 - **Fixed bug.** Checkpoints `-11b` to `-11e` contain a fusion that corrupts prompt batches of ≥ 64 tokens when
   `GGML_ALLOC_FREE_DELAY` is not set (PPL 1.23 → 253 at ubatch 512). Every configuration measured here sets it, so the
   numbers stand, but use `-11f` or later.
-- **Comparisons.** Sushi uses a lower-bit quantization (2.6 bpw experts) and its own engine; TensorFold rows are reference
-  only (different quantization). Thinking is off for every engine. The stop rule was fitted on 48 separate training
+- **Comparisons.** The engines use different quantizations (Sushi: its own 2.6 bpw expert format; TensorFold: MLX 4-bit),
+  so the numbers are reference points, not a like-for-like ranking. Thinking is off for every engine. The stop rule was fitted on 48 separate training
   prompts; the fixed-metric prompts and the held-out set were never used for fitting.
 - **Cold pages.** The 27.5 GB n-gram table is read through mmap on the CPU; on a 64 GB machine cold rows cost up to
   4-5 ms per verify. The fixed metric repeats its prompts and sees warm pages; a first-time text can be slower.
@@ -162,6 +164,20 @@ Verify before trusting a build:
 - 3x the start on this Mac (the project goal) — the ceiling analysis is in `CONCLUSIONS.md` §4.
 - **GLM-5.3-Flash** (320B MoE, Q2-Q3) on a 64 GB Mac and an RTX 4090-class PC, including using both machines together.
   Baselines on the same hardware first; results will appear here.
+
+## Acknowledgements
+
+This work stands on the shoulders of the local-LLM community. Thank you to:
+- **llama.cpp / ggml** (ggml-org and contributors) — the engine this fork builds on, including the model support, the MTP
+  speculative path and the Metal backend;
+- **Qwen** for Qwen3.8-Flash-Next, **ISTA-DASLab** for the GSQ-RCO quantization, and the authors of the MTP GGUF sidecar;
+- **Sushi** — a fast MLX-based engine for the same model; its write-ups on few-row expert kernels matched and guided our own
+  findings, and its idea of warming the n-gram table is on our list;
+- **TensorFold** — SSD expert streaming that makes models larger than memory usable on Macs, and a reference we measured;
+- **Strata** — `bench-strata.py` in `mac125b/tools/measure/` comes from the Strata project and is the benchmark we use;
+- **MLX**, **mlx-flash** and everyone sharing measurements, kernels and ideas in public.
+
+Every one of these projects pushes local AI forward. If we misrepresent any of them, please open an issue and we will fix it.
 
 ## License
 

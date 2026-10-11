@@ -21,7 +21,7 @@ Checkpoint: fork `~/llama.cpp` tag `mac125b-best-2026-10-11f` (run with `~/run-b
 | Sushi 1.2.1 (MLX-based) | Sushi-2.6bpw | 85.5 | 83.9 | 90.6 | 62.0 |
 | **This work** (mean of 2 runs) | same as start | **125.8** | **109.7** | **110.3** | **70.9** |
 
-+64 / +46 / +44 / +47 % over the start; above Sushi on all four (+47 / +31 / +22 / +14 %). Code runs swing ±10 % (115.7 and 104.9). Target: +200 %.
++64 / +46 / +44 / +47 % over the start; Sushi (its own 2.6 bpw quantization) is listed as a reference point on the same machine, not as a ranking. Code runs swing ±10 % (115.7 and 104.9). Target: +200 %.
 The code text is identical to the first checkpoint's; the prose text diverges at character 244. Every speculative configuration,
 including the earlier checkpoints, diverges from plain one-token greedy decoding after 200-300 characters: the verify width changes
 the rounding of near-tie logits. This is not introduced by the stop rule. Reference only (different quantization): TensorFold 0.6.6
@@ -132,7 +132,7 @@ one token, +1.29 ms per extra token), drafts at 0.6 ms and 0.3 ms host time per 
 | code | 5, 4.82 | 21.4 ms | ~225 tok/s | 230 |
 
 Kernel work alone cannot reach 3x. It needs both near-ideal kernels (verify at about half of today's time; the dedicated
-Sushi engine is at 0.87x of ours) and more accepted tokens per round (prose +14-20 %).
+Sushi engine, faster than ours on this pass, takes 0.87x of our time) and more accepted tokens per round (prose +14-20 %).
 
 ## 5. Correctness fix (2026-10-11)
 
