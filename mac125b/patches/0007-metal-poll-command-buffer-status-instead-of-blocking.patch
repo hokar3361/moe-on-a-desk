@@ -1,0 +1,47 @@
+From c6445f3352ef319ab1c7fb15005ad63986ada388 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:20:03 +0900
+Subject: [PATCH 07/49] metal: poll command buffer status instead of blocking
+ (keeps SoC fabric clocks up, -10% decode time)
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 701c17d..160680c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -263,10 +263,28 @@ void ggml_metal_free(ggml_metal_t ctx) {
+     return ctx->name;
+ }
+ 
++// Wait for a command buffer by polling its status instead of blocking.
++// On Apple silicon a fully idle CPU lets the SoC drop the fabric/memory clocks, which costs the GPU
++// ~10% of its decode speed (23.4 -> 21.1 ms/token on M4 Max). A polling core keeps them up.
++// GGML_METAL_SPIN_WAIT=0 restores the blocking wait.
++static void ggml_metal_wait_cmd_buf(id<MTLCommandBuffer> cmd_buf) {
++    static int spin = -1;
++    if (spin < 0) {
++        const char * env = getenv("GGML_METAL_SPIN_WAIT");
++        spin = env == NULL || atoi(env) != 0;
++    }
++    if (spin) {
++        while ([cmd_buf status] < MTLCommandBufferStatusCompleted) {
++            // busy poll
++        }
++    }
++    [cmd_buf waitUntilCompleted];
++}
++
+ void ggml_metal_synchronize(ggml_metal_t ctx) {
+     // wait for any backend operations to finish
+     if (ctx->cmd_buf_last) {
+-        [ctx->cmd_buf_last waitUntilCompleted];
++        ggml_metal_wait_cmd_buf(ctx->cmd_buf_last);
+         ctx->cmd_buf_last = nil;
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,212 @@
+From bc228241984b2fcc3efdbb91d46953ccfcc51110 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:31:34 +0900
+Subject: [PATCH 11/49] metal: GGML_METAL_PROF_IDS expert reuse profiling
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m  |  4 ++
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 11 ++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  8 +++
+ ggml/src/ggml-metal/ggml-metal-device.m   | 70 +++++++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 18 ++++++
+ ggml/src/ggml-metal/kernels/misc.metal    | 11 ++++
+ 6 files changed, 122 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 160680c..fb1e3bc 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -288,6 +288,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+         ctx->cmd_buf_last = nil;
+     }
+ 
++    if (ggml_metal_prof_ids_enabled()) {
++        ggml_metal_prof_ids_flush(ctx->dev);
++    }
++
+     // check status of all command buffers
+     {
+         const int n_cb = ctx->n_cb;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index dc6ebcf..96237e7 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -547,6 +547,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_prof_ids(ggml_metal_library_t lib) {
++    const char * name = "kernel_prof_ids";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc_mix_bf16(ggml_metal_library_t lib) {
+     const char * name = "kernel_hc_mix_bf16";
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 6b8e4aa..9fe5ecc 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -136,6 +136,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc_mix_bf16       (ggml_metal_library_t lib);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_prof_ids          (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+@@ -349,6 +350,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+ 
+ struct ggml_metal_buffer_id ggml_metal_device_get_sync_buffer(ggml_metal_device_t dev);
++
++// profiling of MoE expert reuse (GGML_METAL_PROF_IDS): snapshots live in the sync buffer
++#define GGML_METAL_PROF_IDS_OFFS (40*1024)
++#define GGML_METAL_PROF_IDS_MAX  ((24*1024)/4)
++bool ggml_metal_prof_ids_enabled(void);
++int  ggml_metal_prof_ids_alloc(int n_tok, int n_used); // returns int32 offset into the snapshot area, -1 if full
++void ggml_metal_prof_ids_flush(ggml_metal_device_t dev);
+ uint32_t                    ggml_metal_device_get_sync_error (ggml_metal_device_t dev);
+ 
+ struct ggml_metal_fusion_info;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 910bec2..46a8b79 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1975,6 +1975,76 @@ struct ggml_metal_buffer_id ggml_metal_device_get_sync_buffer(ggml_metal_device_
+     return res;
+ }
+ 
++static struct { int off, n_tok, n_used; } g_prof_ids[2048];
++static int      g_prof_ids_n   = 0;
++static int      g_prof_ids_top = 0;
++static uint64_t g_prof_pairs[33], g_prof_unique[33], g_prof_calls[33];
++static uint64_t g_prof_hist[33][41];
++
++static void ggml_metal_prof_ids_report(void) {
++    for (int t = 2; t <= 32; ++t) {
++        if (!g_prof_calls[t]) {
++            continue;
++        }
++        fprintf(stderr, "prof-ids: n_tok=%d calls=%llu pairs=%llu unique=%llu -> expert reads %.1f%% of pairs\n",
++                t, (unsigned long long) g_prof_calls[t], (unsigned long long) g_prof_pairs[t],
++                (unsigned long long) g_prof_unique[t], 100.0*g_prof_unique[t]/g_prof_pairs[t]);
++        if (t == 4) {
++            fprintf(stderr, "prof-ids: n_tok=4 histogram of distinct experts per layer:");
++            for (int u = 10; u <= 40; ++u) {
++                if (g_prof_hist[t][u]) fprintf(stderr, " %d:%llu", u, (unsigned long long) g_prof_hist[t][u]);
++            }
++            fprintf(stderr, "\n");
++        }
++    }
++}
++
++bool ggml_metal_prof_ids_enabled(void) {
++    static int en = -1;
++    if (en < 0) {
++        en = getenv("GGML_METAL_PROF_IDS") != NULL;
++        if (en) {
++            atexit(ggml_metal_prof_ids_report);
++        }
++    }
++    return en;
++}
++
++int ggml_metal_prof_ids_alloc(int n_tok, int n_used) {
++    if (g_prof_ids_n >= 2048 || g_prof_ids_top + n_tok*n_used > GGML_METAL_PROF_IDS_MAX) {
++        return -1;
++    }
++    const int off = g_prof_ids_top;
++    g_prof_ids[g_prof_ids_n].off    = off;
++    g_prof_ids[g_prof_ids_n].n_tok  = n_tok;
++    g_prof_ids[g_prof_ids_n].n_used = n_used;
++    g_prof_ids_n++;
++    g_prof_ids_top += n_tok*n_used;
++    return off;
++}
++
++void ggml_metal_prof_ids_flush(ggml_metal_device_t dev) {
++    const int32_t * snap = (const int32_t *) ((const char *) dev->sync_buf.contents + GGML_METAL_PROF_IDS_OFFS);
++    for (int i = 0; i < g_prof_ids_n; ++i) {
++        const int n_tok = g_prof_ids[i].n_tok, n_used = g_prof_ids[i].n_used;
++        const int32_t * ids = snap + g_prof_ids[i].off;
++        int seen[64]; int n_seen = 0;
++        for (int k = 0; k < n_tok*n_used; ++k) {
++            bool found = false;
++            for (int j = 0; j < n_seen; ++j) { if (seen[j] == ids[k]) { found = true; break; } }
++            if (!found && n_seen < 64) seen[n_seen++] = ids[k];
++        }
++        if (n_tok <= 32) {
++            g_prof_calls[n_tok]++;
++            g_prof_pairs[n_tok]  += n_tok*n_used;
++            g_prof_unique[n_tok] += n_seen;
++            if (n_seen <= 40) g_prof_hist[n_tok][n_seen]++;
++        }
++    }
++    g_prof_ids_n = 0;
++    g_prof_ids_top = 0;
++}
++
+ uint32_t ggml_metal_device_get_sync_error(ggml_metal_device_t dev) {
+     if (!dev->sync_buf) {
+         return 0;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index fd36c2f..9368e10 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -3054,6 +3054,24 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+         }
+     } else {
++        if (ggml_metal_prof_ids_enabled() && ne21 > 1) {
++            static const ggml_tensor * last_ids = nullptr;
++            if (op->src[2] != last_ids) {
++                last_ids = op->src[2];
++                const int off = ggml_metal_prof_ids_alloc((int) ne21, (int) ne20);
++                if (off >= 0) {
++                    ggml_metal_buffer_id snap = ggml_metal_device_get_sync_buffer(ctx->dev);
++                    snap.offs += GGML_METAL_PROF_IDS_OFFS;
++                    int32_t a[4] = { (int32_t) ne20, (int32_t) ne21, (int32_t) (nb21/sizeof(int32_t)), off };
++                    ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_prof_ids(lib));
++                    ggml_metal_encoder_set_bytes   (enc, a, sizeof(a), 0);
++                    ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
++                    ggml_metal_encoder_set_buffer  (enc, snap, 2);
++                    ggml_metal_encoder_dispatch_threadgroups(enc, 1, 1, 1, 64, 1, 1);
++                }
++            }
++        }
++
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);
+ 
+         const int nr0 = pipeline.nr0;
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index f282538..541a933 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -949,6 +949,17 @@ kernel void kernel_hc_mix_bf16(
+ 
+ #endif
+ 
++// profiling: copy the [n_used, n_tok] expert ids of a MUL_MAT_ID into a snapshot area
++kernel void kernel_prof_ids(
++        constant int4 & a,            // n_used, n_tok, row stride in int32, snapshot offset in int32
++        device const int32_t * ids,
++        device       int32_t * snap,
++        ushort tid [[thread_index_in_threadgroup]]) {
++    for (int k = tid; k < a.x*a.y; k += 64) {
++        snap[a.w + k] = ids[(k / a.x)*a.z + (k % a.x)];
++    }
++}
++
+ kernel void kernel_dsv4_hc_post_nocomb_f32(
+         constant ggml_metal_kargs_dsv4_hc_post & args,
+         device const char * x,
+-- 
+2.50.1 (Apple Git-155)
+

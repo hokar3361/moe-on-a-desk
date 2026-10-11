@@ -1,0 +1,158 @@
+From 08cd1b155ee9a36bcb755deccbc8b12605ebbab5 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 16:43:47 +0900
+Subject: [PATCH 39/49] profiling: GGML_METAL_PROF_NOBAR_OPS (drop barriers per
+ op class), GGML_METAL_PROF_STAGELOG (stage map),
+ GGML_METAL_PREFETCH_KB/MOE_KB (opt-in SLC weight prefetch, refuted)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp | 93 +++++++++++++++++++++++++-
+ ggml/src/ggml-metal/kernels/misc.metal | 16 +++++
+ 2 files changed, 108 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index afb35c2..e725e4b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -275,6 +275,69 @@ static bool ggml_metal_op_concurrency_add(ggml_metal_op_t ctx, const ggml_tensor
+     return ggml_mem_ranges_add(ctx->mem_ranges, node);
+ }
+ 
++
++// ---- SLC weight prefetch during DRAM-idle stages (GGML_METAL_PREFETCH_KB) ----
++static bool ggml_metal_pf_heavy(const ggml_tensor * t) {
++    return t->op == GGML_OP_MUL_MAT || t->op == GGML_OP_MUL_MAT_ID || t->op == GGML_OP_FLASH_ATTN_EXT ||
++           t->op == GGML_OP_GATED_DELTA_NET;
++}
++
++static void ggml_metal_op_prefetch(ggml_metal_op_t ctx, int idx_next, size_t kb) {
++    static const size_t ahead = (size_t) (getenv("GGML_METAL_PREFETCH_AHEAD_MB") ? atof(getenv("GGML_METAL_PREFETCH_AHEAD_MB")) : 24.0)*1024*1024;
++    static int    cur_j = -1;                   // graph index of the matmul being prefetched
++    static size_t off   = 0;                    // bytes of its weights already prefetched
++    static int                 last_idx = 1 << 30;
++    if (idx_next < last_idx) { cur_j = -1; off = 0; }   // new graph
++    last_idx = idx_next;
++
++    size_t budget = kb*1024;
++    size_t dist   = 0;                          // weight bytes between here and the prefetch position
++    const int n = ctx->n_nodes();
++    for (int j = idx_next; j < n && budget > 0 && dist < ahead; ++j) {
++        const ggml_tensor * t = ctx->node(j);
++        if (t->op != GGML_OP_MUL_MAT) {
++            continue;
++        }
++        const ggml_tensor * w = t->src[0];
++        if (!w->buffer || ggml_backend_buffer_get_usage(w->buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS || !ggml_is_contiguous(w)) {
++            continue;
++        }
++        const size_t nb = ggml_nbytes(w);
++        size_t done = 0;
++        if (j < cur_j) {
++            dist += nb; continue;          // passed or already fully prefetched
++        } else if (j == cur_j) {
++            done = off;
++        }
++        if (done >= nb) { dist += nb; continue; }
++        const size_t len = std::min(budget, nb - done) & ~(size_t) 15;
++        if (len == 0) { break; }
++
++        static ggml_metal_pipeline_with_params pl = {};
++        if (!pl.pipeline) {
++            pl = ggml_metal_library_get_pipeline(ctx->lib, "kernel_prefetch_w");
++            if (!pl.pipeline) {
++                pl = ggml_metal_library_compile_pipeline(ctx->lib, "kernel_prefetch_w", "kernel_prefetch_w", nullptr);
++            }
++        }
++        ggml_metal_buffer_id bid = ggml_metal_get_buffer_id(w);
++        bid.offs += done;
++        ggml_metal_buffer_id sink = ggml_metal_device_get_sync_buffer(ctx->dev);
++        sink.offs += 32*1024;
++        const uint32_t n16 = (uint32_t) (len/16);
++        const int nth = (int) std::min<uint32_t>(n16, 16384);
++        ggml_metal_encoder_set_pipeline(ctx->enc, pl);
++        ggml_metal_encoder_set_buffer  (ctx->enc, bid, 0);
++        ggml_metal_encoder_set_buffer  (ctx->enc, sink, 1);
++        ggml_metal_encoder_set_bytes   (ctx->enc, (void *) &n16, sizeof(n16), 2);
++        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (nth + 255)/256, 1, 1, 256, 1, 1);
++
++        cur_j = j; off = done + len;
++        budget -= len;
++        dist += nb;
++    }
++}
++
+ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+     struct ggml_tensor * node = ctx->node(idx);
+ 
+@@ -349,7 +412,24 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+             }
+         }
+ 
+-        if (!is_concurrent) {
++        static const char * nobar_env = getenv("GGML_METAL_PROF_NOBAR_OPS");
++        bool nobar = false;
++        if (!is_concurrent && nobar_env) {
++            const bool mm = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
++            const std::string list = std::string(",") + nobar_env + ",";
++            nobar = (mm && list.find(",MM,") != std::string::npos) || (!mm && list.find(",SMALL,") != std::string::npos) ||
++                    list.find(std::string(",") + ggml_op_desc(node) + ",") != std::string::npos;
++        }
++        {
++            static const bool stagelog = getenv("GGML_METAL_PROF_STAGELOG") != nullptr;
++            if (stagelog && ctx->n_nodes_graph() > 5000) {
++                fprintf(stderr, "stagelog %c %s %s %s %lld %lld %lld\n", (!is_concurrent && !nobar) ? 'B' : '.', ggml_op_desc(node), ggml_get_name(node),
++                        node->src[0] ? ggml_type_name(node->src[0]->type) : "-", (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
++            }
++        }
++        if (nobar) {
++            ggml_mem_ranges_reset(ctx->mem_ranges);
++        } else if (!is_concurrent) {
+             ggml_metal_op_concurrency_reset(ctx);
+             // GGML_METAL_PROF_BARLOG: the node that forced each barrier, in graphs with > 5000 nodes
+             static const bool barlog = getenv("GGML_METAL_PROF_BARLOG") != nullptr;
+@@ -649,6 +729,17 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         }
+     }
+ 
++    {
++        static const size_t pf_kb     = getenv("GGML_METAL_PREFETCH_KB") ? (size_t) atoi(getenv("GGML_METAL_PREFETCH_KB")) : 0;
++        static const size_t pf_moe_kb = getenv("GGML_METAL_PREFETCH_MOE_KB") ? (size_t) atoi(getenv("GGML_METAL_PREFETCH_MOE_KB")) : 0;
++        const ggml_tensor * last = ctx->node(idx + n_fuse - 1);
++        if (pf_kb > 0 && !ggml_metal_pf_heavy(last)) {
++            ggml_metal_op_prefetch(ctx, idx + n_fuse, pf_kb);
++        } else if (pf_moe_kb > 0 && last->op == GGML_OP_MUL_MAT_ID) {
++            ggml_metal_op_prefetch(ctx, idx + n_fuse, pf_moe_kb);
++        }
++    }
++
+     return n_fuse;
+ }
+ 
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 541a933..8856422 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -1061,3 +1061,19 @@ kernel void kernel_dsv4_hc_post_f32(
+         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
+     }
+ }
++
++// read-only touch of a weight range (SLC prefetch); the sink write never happens in practice
++kernel void kernel_prefetch_w(
++        device const uint4 * src  [[buffer(0)]],
++        device       uint  * sink [[buffer(1)]],
++        constant     uint  & n    [[buffer(2)]],
++        uint tid  [[thread_position_in_grid]],
++        uint ntot [[threads_per_grid]]) {
++    uint4 acc = uint4(0);
++    for (uint i = tid; i < n; i += ntot) {
++        acc ^= src[i];
++    }
++    if (acc.x == 0x9E3779B9u && acc.y == 0x7F4A7C15u && acc.z == 0x85EBCA6Bu && acc.w == 0xC2B2AE35u) {
++        sink[tid & 255] = acc.x;
++    }
++}
+-- 
+2.50.1 (Apple Git-155)
+

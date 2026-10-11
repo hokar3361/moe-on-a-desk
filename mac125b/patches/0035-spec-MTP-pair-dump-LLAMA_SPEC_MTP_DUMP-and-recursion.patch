@@ -1,0 +1,148 @@
+From 12d8306287a5ef16572a89d476889e8cb0276333 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 14:28:45 +0900
+Subject: [PATCH 35/49] spec: MTP pair dump (LLAMA_SPEC_MTP_DUMP) and recursion
+ adapter experiment (LLAMA_SPEC_MTP_ADAPTER, refuted; opt-in only)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 95 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 94 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 17365a9..11ae5d2 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1387,6 +1387,60 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+     }
+ };
+ 
++
++#include <dlfcn.h>
++// recursion adapter for chained MTP draft steps (LLAMA_SPEC_MTP_ADAPTER)
++struct mtp_adapter {
++    int ne = 0, r = 0, n_streams = 4;
++    std::vector<float> mx, b, W, U, V, xc, t, y;
++    typedef void (*sgemv_t)(int, int, int, int, float, const float *, int, const float *, int, float, float *, int);
++    sgemv_t sgemv = nullptr;
++
++    bool load(const char * path, int n_embd_out) {
++        FILE * f = fopen(path, "rb");
++        if (!f) return false;
++        int32_t hdr[2];
++        if (fread(hdr, 4, 2, f) != 2 || hdr[0] != n_embd_out) { fclose(f); return false; }
++        ne = hdr[0]; r = hdr[1];
++        mx.resize(ne); b.resize(ne);
++        bool ok = fread(mx.data(), 4, ne, f) == (size_t) ne && fread(b.data(), 4, ne, f) == (size_t) ne;
++        if (r == 0) {
++            W.resize((size_t) ne*ne);
++            ok = ok && fread(W.data(), 4, W.size(), f) == W.size();
++        } else {
++            U.resize((size_t) ne*r); V.resize((size_t) r*ne);
++            ok = ok && fread(U.data(), 4, U.size(), f) == U.size() && fread(V.data(), 4, V.size(), f) == V.size();
++        }
++        fclose(f);
++        void * h = dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", RTLD_LAZY);
++        sgemv = h ? (sgemv_t) dlsym(h, "cblas_sgemv") : nullptr;
++        xc.resize(ne); y.resize(ne); t.resize(std::max(r, 1));
++        return ok && sgemv;
++    }
++
++    // in: MTP output residual (ne floats); out: adapted h
++    void apply(const float * in, float * out) {
++        const int ns = ne/n_streams;
++        for (int s = 0; s < n_streams; ++s) {
++            double ss = 0.0;
++            for (int i = 0; i < ns; ++i) ss += (double) in[s*ns + i]*in[s*ns + i];
++            const float sc = 1.0f/sqrtf((float) (ss/ns) + 1e-6f);
++            for (int i = 0; i < ns; ++i) {
++                out[s*ns + i] = in[s*ns + i]*sc;
++                xc[s*ns + i]  = out[s*ns + i] - mx[s*ns + i];
++            }
++        }
++        const int RowMajor = 101, Trans = 112;
++        if (r == 0) {
++            sgemv(RowMajor, Trans, ne, ne, 1.0f, W.data(), ne, xc.data(), 1, 0.0f, y.data(), 1);
++        } else {
++            sgemv(RowMajor, Trans, ne, r, 1.0f, U.data(), r, xc.data(), 1, 0.0f, t.data(), 1);
++            sgemv(RowMajor, Trans, r, ne, 1.0f, V.data(), ne, t.data(), 1, 0.0f, y.data(), 1);
++        }
++        for (int i = 0; i < ne; ++i) out[i] += y[i] + b[i];
++    }
++};
++
+ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
+ 
+@@ -1428,6 +1482,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     // merged catch-up (LLAMA_SPEC_MTP_MERGE=1): the catch-up over a verify batch is deferred to the next draft() and
+     // decoded together with the first draft step, over the accepted tokens only
+     bool merge = false;
++    mtp_adapter adapter;
++    bool use_adapter = false;
++    std::vector<std::vector<float>> h_adapt;
++    FILE * dump_f = nullptr;
+     std::vector<bool>                   gen;        // a draft() ran since begin()
+     std::vector<bool>                   def_valid;
+     std::vector<llama_tokens>           def_tok;
+@@ -1725,6 +1783,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
+ 
++        if (const char * dp = getenv("LLAMA_SPEC_MTP_DUMP")) {
++            dump_f = fopen(dp, "ab");
++            if (dump_f) {
++                llama_set_embeddings_nextn(this->params.ctx_dft, true, /*masked*/ false);
++                LOG_INF("%s: dumping (h_mtp, h_tgt) pairs to %s\n", __func__, dp);
++            }
++        }
++        if (const char * ap = getenv("LLAMA_SPEC_MTP_ADAPTER")) {
++            use_adapter = adapter.load(ap, n_embd);
++            h_adapt.assign(n_seq, std::vector<float>(n_embd, 0.0f));
++            LOG_INF("%s: MTP recursion adapter %s: %s (rank %d)\n", __func__, ap, use_adapter ? "loaded" : "FAILED", adapter.r);
++        }
+         merge = getenv("LLAMA_SPEC_MTP_MERGE") && atoi(getenv("LLAMA_SPEC_MTP_MERGE")) != 0 && !chain_heads && !is_mem_shared;
+         gen.assign(n_seq, false);
+         def_valid.assign(n_seq, false);
+@@ -1897,6 +1967,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (!ok) {
+                 return false;
+             }
++
++            if (dump_f && n_tokens > 16) {
++                const int64_t ne = (int64_t) n_embd;
++                std::vector<ggml_fp16_t> buf(2*ne);
++                for (int k = 0; k < n_tokens; ++k) {
++                    const float * hm = llama_get_embeddings_nextn_ith(ctx_dft, k);
++                    const float * ht = llama_get_embeddings_nextn_ith(ctx_tgt, k);
++                    if (!hm || !ht || batch_in.tokens[k].id == LLAMA_TOKEN_NULL) {
++                        continue;
++                    }
++                    ggml_fp32_to_fp16_row(hm, buf.data(), ne);
++                    ggml_fp32_to_fp16_row(ht, buf.data() + ne, ne);
++                    const int32_t tok = batch_in.tokens[k].id;
++                    fwrite(&tok, sizeof(tok), 1, dump_f);
++                    fwrite(buf.data(), sizeof(ggml_fp16_t), 2*ne, dump_f);
++                }
++                fflush(dump_f);
++            }
+         }
+ 
+         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+@@ -2233,7 +2321,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     i_last[seq_id] = idx;
+                 } else {
+                     const int32_t idx = batch.add(id, dp.pos0 + i + 1, seq_id, true);
+-                    batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
++                    const float * h_next = h_row;
++                    if (use_adapter) {
++                        adapter.apply(h_row, h_adapt[seq_id].data());
++                        h_next = h_adapt[seq_id].data();
++                    }
++                    batch.set_embd_state(idx, { h_next, 1, (size_t) n_embd });
+                     i_last[seq_id] = idx;
+                 }
+             }
+-- 
+2.50.1 (Apple Git-155)
+

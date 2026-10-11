@@ -1,0 +1,29 @@
+From 9f04902e56286529cf94f933253a61cac516e27a Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 19:43:25 +0900
+Subject: [PATCH 47/49] llama-model: opt-in LLAMA_GPU_OWN_WEIGHTS copies GPU
+ weights into backend-owned buffers (measurement: no change vs mmap-wrapped)
+
+---
+ src/llama-model.cpp | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 06c87a8..00c0178 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1944,7 +1944,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
+         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+ 
+-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
++        // opt-in: weights of non-CPU devices are copied into backend-owned buffers instead of wrapping the mmap
++        const bool own_weights = getenv("LLAMA_GPU_OWN_WEIGHTS") != nullptr && ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_CPU && !is_lazy_mapped;
++
++        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !own_weights) {
+             GGML_ASSERT(!ml.no_alloc);
+             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
+-- 
+2.50.1 (Apple Git-155)
+

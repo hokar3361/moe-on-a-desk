@@ -1,0 +1,630 @@
+From 51538aa45469ebe187db1fce302df790dddfa663 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:08:26 +0900
+Subject: [PATCH 04/49] qwen4exp/metal: hc mix as one persistent dispatch with
+ grid sync (v1)
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  11 ++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  12 ++
+ ggml/src/ggml-metal/ggml-metal-device.m   |  23 +++
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 137 ++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-fusion.h   |   1 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     |  19 +++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  79 +++++++++++
+ ggml/src/ggml-metal/kernels/misc.metal    | 163 ++++++++++++++++++++++
+ src/models/qwen4exp.cpp                   |  13 +-
+ 9 files changed, 453 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 8ac6e08..dc6ebcf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -547,6 +547,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc_mix_bf16(ggml_metal_library_t lib) {
++    const char * name = "kernel_hc_mix_bf16";
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
+         ggml_metal_library_t lib, const ggml_tensor * op, int32_t nc, bool use_silu) {
+     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 4012b9d..6b8e4aa 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -11,6 +11,14 @@ struct ggml_metal_buffer_id {
+     size_t offs;
+ };
+ 
++// device-owned buffer for grid-wide sync of persistent kernels:
++// uint32 [0, 2*GGML_METAL_SYNC_SLOTS) = (arrive, exit) counter pairs, [GGML_METAL_SYNC_ERR_IDX] = spin timeout flag,
++// float scratch from byte GGML_METAL_SYNC_SCRATCH_OFFS
++#define GGML_METAL_SYNC_SLOTS        256
++#define GGML_METAL_SYNC_ERR_IDX      (2*GGML_METAL_SYNC_SLOTS)
++#define GGML_METAL_SYNC_SCRATCH_OFFS 4096
++#define GGML_METAL_SYNC_BUF_SIZE     (64*1024)
++
+ typedef struct ggml_metal_device * ggml_metal_device_t;
+ 
+ //
+@@ -127,6 +135,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_tri
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max          (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc_mix_bf16       (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+@@ -339,6 +348,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+ 
+ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev);
+ 
++struct ggml_metal_buffer_id ggml_metal_device_get_sync_buffer(ggml_metal_device_t dev);
++uint32_t                    ggml_metal_device_get_sync_error (ggml_metal_device_t dev);
++
+ struct ggml_metal_fusion_info;
+ 
+ // the device-owned fusion debugging context (NULL unless fusion debugging is enabled)
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 13aecbd..910bec2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -917,6 +917,9 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
+ 
+     // virtual address for GPU memory allocations
+     atomic_uintptr_t addr_virt;
++
++    // grid-sync counters + scratch for persistent (single dispatch, multi phase) kernels
++    id<MTLBuffer> sync_buf;
+ };
+ 
+ //
+@@ -1312,6 +1315,9 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
+                     GGML_LOG_ERROR("%s: error: failed to create library\n", __func__);
+                 }
+ 
++                dev->sync_buf = [dev->mtl_device newBufferWithLength:GGML_METAL_SYNC_BUF_SIZE options:MTLResourceStorageModeShared];
++                memset(dev->sync_buf.contents, 0, GGML_METAL_SYNC_BUF_SIZE);
++
+                 if (dev->props.use_residency_sets) {
+                     dev->rsets = ggml_metal_rsets_init(dev);
+                 } else {
+@@ -1381,6 +1387,11 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
+         ggml_metal_library_free(dev->library);
+         dev->library = NULL;
+ 
++        if (dev->sync_buf) {
++            [dev->sync_buf release];
++            dev->sync_buf = nil;
++        }
++
+         if (dev->mtl_queue) {
+             [dev->mtl_queue release];
+             dev->mtl_queue = nil;
+@@ -1959,6 +1970,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+     }
+ }
+ 
++struct ggml_metal_buffer_id ggml_metal_device_get_sync_buffer(ggml_metal_device_t dev) {
++    struct ggml_metal_buffer_id res = { (void *) dev->sync_buf, 0 };
++    return res;
++}
++
++uint32_t ggml_metal_device_get_sync_error(ggml_metal_device_t dev) {
++    if (!dev->sync_buf) {
++        return 0;
++    }
++    return ((volatile uint32_t *) dev->sync_buf.contents)[GGML_METAL_SYNC_ERR_IDX];
++}
++
+ const struct ggml_metal_device_props * ggml_metal_device_get_props(ggml_metal_device_t dev) {
+     return &dev->props;
+ }
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index c651dbe..1830df2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -808,6 +808,142 @@ static bool ggml_metal_fusion_check_hc_post_gate(
+     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), &out, 1);
+ }
+ 
++static const ggml_tensor * ggml_metal_fusion_view_root(const ggml_tensor * t) {
++    while (t && t->view_src) {
++        t = t->view_src;
++    }
++    return t;
++}
++
++// every use of node t_idx (directly, or through empty view nodes) is by a node at index <= hi
++static bool ggml_metal_fusion_used_only_until(const ggml_cgraph * gf, int t_idx, int hi, int depth) {
++    const ggml_tensor * t = gf->nodes[t_idx];
++    if (t->flags & GGML_TENSOR_FLAG_OUTPUT) {
++        return false;
++    }
++    int uses = 0;
++    for (int k = t_idx + 1; k <= hi; ++k) {
++        const ggml_tensor * n = gf->nodes[k];
++        bool refs = false;
++        for (int s = 0; s < GGML_MAX_SRC; ++s) {
++            if (n->src[s] == t) {
++                uses++;
++                refs = true;
++            }
++        }
++        if (refs && ggml_op_is_empty(n->op)) {
++            if (depth >= 4 || !ggml_metal_fusion_used_only_until(gf, k, hi, depth + 1)) {
++                return false;
++            }
++        }
++    }
++    return uses == ggml_node_get_use_count(gf, t_idx);
++}
++
++// decode hyper-connection mix, see kernel_hc_mix_bf16
++static bool ggml_metal_fusion_check_hc_mix(
++        const ggml_metal_fusion       * fusion,
++        const ggml_tensor * const     * nodes,
++        const ggml_cgraph             * gf,
++        const int                     * node_idxs,
++              int                       idx,
++              ggml_metal_fusion_mode    mode) {
++    GGML_UNUSED(mode);
++
++    static const bool disabled = getenv("GGML_METAL_HC_MIX_DISABLE") != nullptr;
++    if (disabled) {
++        return false;
++    }
++
++    const ggml_tensor * norm = nodes[0];
++    const ggml_tensor * mul  = nodes[1];
++    const ggml_tensor * inj  = nodes[2];
++    const ggml_tensor * down = nodes[3];
++    const ggml_tensor * sc   = nodes[4];
++    const ggml_tensor * act  = nodes[5];
++    const ggml_tensor * up   = nodes[6];
++    const ggml_tensor * pre  = nodes[7];
++
++    const ggml_tensor * x = norm->src[0];
++    const int64_t n_embd = x->ne[0];
++    const int64_t hc     = x->ne[1];
++
++    if (x->type != GGML_TYPE_F32 || hc != 4 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(x)) {
++        return false;
++    }
++    if (n_embd % 256 != 0) {
++        return false;
++    }
++
++    // mul = norm * w_norm with w_norm [n_embd, hc]
++    const ggml_tensor * wn = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++    if ((mul->src[0] != norm && mul->src[1] != norm) || wn->type != GGML_TYPE_F32 ||
++        !ggml_are_same_shape(wn, x) || !ggml_is_contiguous(wn)) {
++        return false;
++    }
++
++    // projections read xn (a reshape of mul)
++    auto reads_xn = [&](const ggml_tensor * t) { return ggml_metal_fusion_view_root(t) == mul; };
++    if (!reads_xn(inj->src[1]) || !reads_xn(down->src[1]) || !reads_xn(pre->src[0])) {
++        return false;
++    }
++
++    const ggml_tensor * w_inj  = inj->src[0];
++    const ggml_tensor * w_down = down->src[0];
++    const ggml_tensor * w_up   = up->src[0];
++    const int64_t n_lo = w_down->ne[1];
++
++    if (w_inj->type != GGML_TYPE_BF16 || w_down->type != GGML_TYPE_BF16 || w_up->type != GGML_TYPE_BF16) {
++        return false;
++    }
++    if (w_inj->ne[0] != n_embd*hc || w_inj->ne[1] != hc || w_down->ne[0] != n_embd*hc ||
++        w_up->ne[0] != n_lo || w_up->ne[1] != n_embd*hc) {
++        return false;
++    }
++    if (n_lo % 64 != 0 || n_lo > 1024) {
++        return false;
++    }
++    if (w_inj->nb[0] != 2 || w_down->nb[0] != 2 || w_up->nb[0] != 2) {
++        return false;
++    }
++
++    if (sc->op != GGML_OP_SCALE || sc->src[0] != down || ggml_get_unary_op(act) != GGML_UNARY_OP_SILU ||
++        act->src[0] != sc || up->src[1] != act) {
++        return false;
++    }
++
++    // gated hc_pre over [n_embd, hc] views of xn and the up projection
++    if (ggml_get_op_params_i32(pre, 1) == 0 || ggml_metal_fusion_view_root(pre->src[1]) != up ||
++        pre->src[0]->ne[0] != n_embd || pre->src[0]->ne[1] != hc || pre->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (inj->type != GGML_TYPE_F32 || inj->ne[1] != 1) {
++        return false;
++    }
++
++    // inject and mixed leave the pattern, everything else (also through reshape views) stays inside
++    GGML_UNUSED(fusion);
++    const int hi = node_idxs[idx + 7];
++    for (int j = 0; j < 8; ++j) {
++        const ggml_tensor * t = nodes[j];
++        if ((t->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return false;
++        }
++        if (j == 2 || j == 7) {
++            continue;
++        }
++        if (!ggml_metal_fusion_used_only_until(gf, node_idxs[idx + j], hi, 0)) {
++            return false;
++        }
++    }
++    return true;
++}
++
++static const std::vector<ggml_op> ops_hc_mix = {
++    GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT,
++    GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT, GGML_OP_DSV4_HC_PRE,
++};
++
+ static const std::vector<ggml_op> ops_hc_post_gate = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
+ 
+ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+@@ -839,6 +975,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+     { GGML_METAL_FUSION_HC_POST_GATE,   ops_hc_post_gate,           {},     true,  ggml_metal_fusion_check_hc_post_gate },
++    { GGML_METAL_FUSION_HC_MIX,         ops_hc_mix,                 {2},    true,  ggml_metal_fusion_check_hc_mix },
+ };
+ 
+ // ---- alloc deps -----------------------------------------------------------
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index a859f5f..6433255 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -44,6 +44,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
+     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
+     GGML_METAL_FUSION_HC_POST_GATE, // SCALE + UNARY(sigmoid) + SCALE + DSV4_HC_POST (gate computed in the post kernel)
++    GGML_METAL_FUSION_HC_MIX,       // RMS_NORM + MUL + MUL_MAT x3 + SCALE + UNARY(silu) + DSV4_HC_PRE (one persistent dispatch)
+ } ggml_metal_fusion_id;
+ 
+ struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 15bca09..571b97f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1347,6 +1347,25 @@ typedef struct {
+     float    post_b_out;
+ } ggml_metal_kargs_dsv4_hc_post;
+ 
++typedef struct {
++    int32_t  n_embd;     // per stream
++    int32_t  n_lo;       // rows of the down projection
++    int32_t  n_tg;       // threadgroups in the grid (all resident)
++    uint32_t slot;       // grid-sync counter pair
++    uint64_t nb_x1;      // stream stride of x
++    uint64_t nb_wn1;     // stream stride of the norm weight
++    uint64_t nb_down1;
++    uint64_t nb_inj1;
++    uint64_t nb_up1;
++    uint64_t nb_inj_d0;  // inject output element stride
++    uint64_t nb_mix_d0;  // mixed output element stride
++    float    eps;
++    float    s_in;       // SCALE before silu
++    float    b_in;
++    float    pre_scale;  // DSV4_HC_PRE scale
++    int32_t  phases;     // profiling: bit0 phase 1, bit1 phase 2
++} ggml_metal_kargs_hc_mix;
++
+ typedef struct {
+     int32_t  ne00;
+     int32_t  ne01;
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 3ac158d..0ec745e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4470,9 +4470,88 @@ int ggml_metal_op_group_norm(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++static int ggml_metal_op_hc_mix(ggml_metal_op_t ctx, int idx, int n_fuse) {
++    const ggml_tensor * norm = ctx->node(idx);
++    const ggml_tensor * mul  = ctx->node(idx + 1);
++    const ggml_tensor * inj  = ctx->node(idx + 2);
++    const ggml_tensor * down = ctx->node(idx + 3);
++    const ggml_tensor * sc   = ctx->node(idx + 4);
++    const ggml_tensor * up   = ctx->node(idx + 6);
++    const ggml_tensor * pre  = ctx->node(idx + 7);
++
++    GGML_ASSERT(n_fuse == 8);
++
++    const ggml_tensor * x  = norm->src[0];
++    const ggml_tensor * wn = mul->src[0] == norm ? mul->src[1] : mul->src[0];
++
++    static const int n_tg = getenv("GGML_METAL_HC_MIX_TG") ? atoi(getenv("GGML_METAL_HC_MIX_TG")) : 80;
++    static uint32_t slot = 0;
++
++    float eps;
++    memcpy(&eps, norm->op_params, sizeof(float));
++
++    ggml_metal_kargs_hc_mix args = {
++        /*.n_embd    =*/ (int32_t) x->ne[0],
++        /*.n_lo      =*/ (int32_t) down->src[0]->ne[1],
++        /*.n_tg      =*/ n_tg,
++        /*.slot      =*/ slot,
++        /*.nb_x1     =*/ x->nb[1],
++        /*.nb_wn1    =*/ wn->nb[1],
++        /*.nb_down1  =*/ down->src[0]->nb[1],
++        /*.nb_inj1   =*/ inj->src[0]->nb[1],
++        /*.nb_up1    =*/ up->src[0]->nb[1],
++        /*.nb_inj_d0 =*/ inj->nb[0],
++        /*.nb_mix_d0 =*/ pre->nb[0],
++        /*.eps       =*/ eps,
++        /*.s_in      =*/ ggml_get_op_params_f32(sc, 0),
++        /*.b_in      =*/ ggml_get_op_params_f32(sc, 1),
++        /*.pre_scale =*/ ggml_get_op_params_f32(pre, 0),
++        /*.phases    =*/ getenv("GGML_METAL_HC_MIX_PHASES") ? atoi(getenv("GGML_METAL_HC_MIX_PHASES")) : 3,
++    };
++    slot = (slot + 1) % GGML_METAL_SYNC_SLOTS;
++
++    // the concurrency check of the caller covers x (first node) and mixed (last node);
++    // inject is written too, so make sure it does not race with in-flight nodes
++    if (ctx->mem_ranges && !ggml_mem_ranges_check(ctx->mem_ranges, inj)) {
++        ggml_metal_op_concurrency_reset(ctx);
++    }
++
++    static const bool prof_skip = getenv("GGML_METAL_PROF_SKIP") && strstr(getenv("GGML_METAL_PROF_SKIP"), "HC_MIX");
++    if (prof_skip) {
++        return n_fuse;
++    }
++
++    ggml_metal_encoder_t enc = ctx->enc;
++    ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_hc_mix_bf16(ctx->lib));
++
++    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),            1);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(wn),           2);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(down->src[0]), 3);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(inj->src[0]),  4);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(up->src[0]),   5);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(inj),          6);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(pre),          7);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_device_get_sync_buffer(ctx->dev), 8);
++
++    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(args.n_lo*sizeof(float), 16), 0);
++    ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, 32*8, 1, 1);
++
++    return n_fuse;
++}
++
+ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
++    if (op->op == GGML_OP_RMS_NORM && ctx->use_fusion()) {
++        int n = 1;
++        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
++        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_HC_MIX) {
++            ctx->count_fusions(fusion);
++            return ggml_metal_op_hc_mix(ctx, idx, n);
++        }
++    }
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 71d712f..98195ba 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -676,6 +676,169 @@ kernel void kernel_dsv4_hc_pre_gated_f32(
+     *(device float *) (dst + i0*args.nb_d0 + it*args.nb_d1) = args.scale*result;
+ }
+ 
++#if defined(GGML_METAL_HAS_BF16) && __METAL_VERSION__ >= 320
++
++#define HC_MIX_NSG 8
++
++// grid-wide barrier for a dispatch whose threadgroups are all resident.
++// data written before it by any threadgroup is visible after it (coherent(device) + device fences)
++static inline void hc_grid_sync(device atomic_uint * arrive, uint target, ushort tid, device atomic_uint * err) {
++    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++    threadgroup_barrier(mem_flags::mem_device);
++    if (tid == 0) {
++        atomic_fetch_add_explicit(arrive, 1u, memory_order_relaxed);
++        uint spins = 0;
++        while (atomic_load_explicit(arrive, memory_order_relaxed) < target) {
++            if (++spins > (1u << 24)) {
++                atomic_store_explicit(err, 1u, memory_order_relaxed);
++                break;
++            }
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_device);
++    atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
++}
++
++// decode hyper-connection mix, hc = 4, one token:
++//   xn  = rms_norm(x)*w_norm                       (per stream)
++//   inj = W_inject xn,  lo = silu(s_in*(W_down xn) + b_in)
++//   mixed[i] = pre_scale * sum_c xn[i,c]*sigmoid((W_up lo)[c*n_embd + i])
++kernel void kernel_hc_mix_bf16(
++        constant ggml_metal_kargs_hc_mix & args,
++        device const char * x,
++        device const char * wn,
++        device const char * wd,
++        device const char * wi,
++        device const char * wu,
++        device       char * inj,
++        device       char * mixed,
++        device coherent(device) char * sync,
++        threadgroup float * shmem [[threadgroup(0)]],
++        uint   tgpig [[threadgroup_position_in_grid]],
++        ushort tid   [[thread_index_in_threadgroup]],
++        ushort tiisg [[thread_index_in_simdgroup]],
++        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
++    constexpr int hc = 4;
++
++    device atomic_uint * arrive = (device atomic_uint *) sync + 2*args.slot;
++    device atomic_uint * exitc  = (device atomic_uint *) sync + 2*args.slot + 1;
++    device atomic_uint * err    = (device atomic_uint *) sync + 2*256;
++    device coherent(device) float * act = (device coherent(device) float *) (sync + 4096);
++    device coherent(device) float * rr  = act + 1024;
++
++    const int n_embd = args.n_embd;
++    const int n_lo   = args.n_lo;
++    const int g      = tgpig*HC_MIX_NSG + sgitg;
++    const int n_sg   = args.n_tg*HC_MIX_NSG;
++
++    // ---- phase 1: one simdgroup per row of [W_down; W_inject]
++    if ((args.phases & 1) && g < n_lo + hc) {
++        device const bfloat * w = g < n_lo
++            ? (device const bfloat *) (wd + g*args.nb_down1)
++            : (device const bfloat *) (wi + (g - n_lo)*args.nb_inj1);
++
++        float acc[hc];
++        float sq[hc];
++        FOR_UNROLL (int c = 0; c < hc; ++c) {
++            device const float  * xs = (device const float  *) (x  + c*args.nb_x1);
++            device const float  * ws = (device const float  *) (wn + c*args.nb_wn1);
++            device const bfloat * wr = w + c*n_embd;
++            float a = 0.0f;
++            float q = 0.0f;
++            for (int i = tiisg*8; i < n_embd; i += 32*8) {
++                const float4 x0 = *(device const float4 *) (xs + i);
++                const float4 x1 = *(device const float4 *) (xs + i + 4);
++                const float4 n0 = *(device const float4 *) (ws + i);
++                const float4 n1 = *(device const float4 *) (ws + i + 4);
++                const float4 b0 = float4(*(device const bfloat4 *) (wr + i));
++                const float4 b1 = float4(*(device const bfloat4 *) (wr + i + 4));
++                a += dot(b0, x0*n0) + dot(b1, x1*n1);
++                q += dot(x0, x0) + dot(x1, x1);
++            }
++            acc[c] = simd_sum(a);
++            sq[c]  = simd_sum(q);
++        }
++
++        float r[hc];
++        float v = 0.0f;
++        FOR_UNROLL (int c = 0; c < hc; ++c) {
++            const float mean = sq[c]/n_embd;
++            r[c] = 1.0f/sqrt(mean + args.eps);
++            v += acc[c]*r[c];
++        }
++
++        if (tiisg == 0) {
++            if (g < n_lo) {
++                const float t = args.s_in*v + args.b_in;
++                act[g] = t / (1 + exp(-t));
++            } else {
++                *(device float *) (inj + (g - n_lo)*args.nb_inj_d0) = v;
++            }
++            if (g == 0) {
++                FOR_UNROLL (int c = 0; c < hc; ++c) {
++                    rr[c] = r[c];
++                }
++            }
++        }
++    }
++
++    hc_grid_sync(arrive, (uint) args.n_tg, tid, err);
++
++    // ---- phase 2: rows i, i+n_embd, i+2n_embd, i+3n_embd of W_up per output, 8 lanes per row
++    for (int k = tid; k < n_lo; k += 32*HC_MIX_NSG) {
++        shmem[k] = act[k];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    float r[hc];
++    FOR_UNROLL (int c = 0; c < hc; ++c) {
++        r[c] = rr[c];
++    }
++
++    const int c    = tiisg/8;
++    const int part = tiisg%8;
++    const int per  = n_lo/8;
++
++    for (int i = g; (args.phases & 2) && i < n_embd; i += n_sg) {
++        device const bfloat * wrow = (device const bfloat *) (wu + (c*n_embd + i)*args.nb_up1) + part*per;
++        threadgroup const float * a = shmem + part*per;
++        float s = 0.0f;
++        for (int e = 0; e < per; e += 8) {
++            const float4 b0 = float4(*(device const bfloat4 *) (wrow + e));
++            const float4 b1 = float4(*(device const bfloat4 *) (wrow + e + 4));
++            s += dot(b0, *(threadgroup const float4 *) (a + e)) + dot(b1, *(threadgroup const float4 *) (a + e + 4));
++        }
++        s += simd_shuffle_xor(s, 1);
++        s += simd_shuffle_xor(s, 2);
++        s += simd_shuffle_xor(s, 4);
++
++        const float xv  = *(device const float *) (x  + c*args.nb_x1  + i*sizeof(float));
++        const float wv  = *(device const float *) (wn + c*args.nb_wn1 + i*sizeof(float));
++        const float xn  = (xv*r[c])*wv;
++        const float gt  = 1.0f/(1.0f + exp(-s));
++
++        float result = 0.0f;
++        FOR_UNROLL (int cc = 0; cc < hc; ++cc) {
++            result = fma(simd_shuffle(xn, cc*8), simd_shuffle(gt, cc*8), result);
++        }
++        if (tiisg == 0) {
++            *(device float *) (mixed + i*args.nb_mix_d0) = args.pre_scale*result;
++        }
++    }
++
++    // last threadgroup out resets the counter pair for the next dispatch on this slot
++    threadgroup_barrier(mem_flags::mem_device);
++    if (tid == 0) {
++        const uint old = atomic_fetch_add_explicit(exitc, 1u, memory_order_relaxed);
++        if (old == (uint) args.n_tg - 1) {
++            atomic_store_explicit(arrive, 0u, memory_order_relaxed);
++            atomic_store_explicit(exitc,  0u, memory_order_relaxed);
++        }
++    }
++}
++
++#endif
++
+ kernel void kernel_dsv4_hc_post_nocomb_f32(
+         constant ggml_metal_kargs_dsv4_hc_post & args,
+         device const char * x,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index c1771fc..d9687b6 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -328,6 +328,14 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     xn = ggml_reshape_2d(ctx0, xn, hc_dim, nt);
+     cb(xn, "hc_norm", il);
+ 
++    // inject first, so norm -> inject -> down -> up -> pre stay adjacent in the graph
++    // (the Metal backend runs the whole mix as one dispatch for decode)
++    if (inject) {
++        *inject = build_lora_mm(w_inject, xn);
++        cb(*inject, "hc_inject", il);
++        ggml_build_forward_expand(gf, *inject);
++    }
++
+     ggml_tensor * lo = build_lora_mm(w_down, xn);
+     lo = ggml_silu(ctx0, ggml_scale(ctx0, lo, 1.0f / (float) hc));
+     ggml_tensor * gate = build_lora_mm(w_up, lo);
+@@ -358,11 +366,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
+     }
+     cb(mixed, "hc_mixed", il);
+ 
+-    if (inject) {
+-        *inject = build_lora_mm(w_inject, xn);
+-        cb(*inject, "hc_inject", il);
+-    }
+-
+     return mixed;
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

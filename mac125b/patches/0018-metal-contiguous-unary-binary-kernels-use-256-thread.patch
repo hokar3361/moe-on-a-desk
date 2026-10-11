@@ -1,0 +1,75 @@
+From 84c07cc142c2e15b2eecd5c9fb54dad50ae02e50 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:51:01 +0900
+Subject: [PATCH 18/49] metal: contiguous unary/binary kernels use 256-thread
+ threadgroups (were 1-thread)
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp     | 7 +++++--
+ ggml/src/ggml-metal/kernels/binbcast.metal | 8 ++++++--
+ ggml/src/ggml-metal/kernels/unary.metal    | 5 ++++-
+ 3 files changed, 15 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index cc69ab4..8e78c66 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1025,7 +1025,9 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+     if (pipeline.cnt) {
+         const int n = pipeline.c4 ? ggml_nelements(op)/4 : ggml_nelements(op);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, 1, 1, 1);
++        // one-thread threadgroups would leave 31 of 32 SIMD lanes idle
++        const int nth = std::min(256, n);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+         const int nth = MIN(args.ne00, nth_max);
+@@ -4380,7 +4382,8 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
+ 
+     if (pipeline.cnt) {
+-        ggml_metal_encoder_dispatch_threadgroups(enc, args.ne0, ggml_nrows(op), 1, 1, 1, 1);
++        const int nth = std::min(256, (int) args.ne0);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (args.ne0 + nth - 1)/nth, ggml_nrows(op), 1, nth, 1, 1);
+     } else {
+         const int nth_max = MIN(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+ 
+diff --git a/ggml/src/ggml-metal/kernels/binbcast.metal b/ggml/src/ggml-metal/kernels/binbcast.metal
+index 7c7ab9b..f1ee020 100644
+--- a/ggml/src/ggml-metal/kernels/binbcast.metal
++++ b/ggml/src/ggml-metal/kernels/binbcast.metal
+@@ -22,8 +22,12 @@ kernel void kernel_bin_fuse_impl(
+ 
+     if (FC_RB) {
+         // row broadcast
+-        const uint i0 = tgpig.y*args.ne00 + tgpig.x;
+-        const uint i1 = FC_CB ? tgpig.x%args.ne10 : tgpig.x;
++        const uint ix = tgpig.x*ntg.x + tpitg.x;
++        if (ix >= (uint) args.ne0) {
++            return;
++        }
++        const uint i0 = tgpig.y*args.ne00 + ix;
++        const uint i1 = FC_CB ? ix%args.ne10 : ix;
+ 
+         device const T0 * src0_row = (device const T0 *) (src0);
+         device       T  * dst_row  = (device       T  *) (dst);
+diff --git a/ggml/src/ggml-metal/kernels/unary.metal b/ggml/src/ggml-metal/kernels/unary.metal
+index e50a648..bbf53a5 100644
+--- a/ggml/src/ggml-metal/kernels/unary.metal
++++ b/ggml/src/ggml-metal/kernels/unary.metal
+@@ -20,7 +20,10 @@ kernel void kernel_unary_impl(
+     int i0;
+ 
+     if (FC_CNT) {
+-        i0 = tgpig.x;
++        i0 = tgpig.x*ntg.x + tpitg.x;
++        if (i0 >= args.ne0*args.ne1*args.ne2*args.ne3) {
++            return;
++        }
+ 
+         src0_ptr = (device const T0 *) (src0);
+         dst_ptr  = (device       T  *) (dst);
+-- 
+2.50.1 (Apple Git-155)
+

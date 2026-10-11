@@ -1,0 +1,27 @@
+From 3f4d318a183ceb69e0fcf05f46a81276cd18521b Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:24:22 +0900
+Subject: [PATCH 10/49] metal: hc mix opt-in (GGML_METAL_HC_MIX=1) until it
+ beats the unfused path
+
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index b952e34..5f8a5eb 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -850,7 +850,8 @@ static bool ggml_metal_fusion_check_hc_mix(
+               ggml_metal_fusion_mode    mode) {
+     GGML_UNUSED(mode);
+ 
+-    static const bool disabled = getenv("GGML_METAL_HC_MIX_DISABLE") != nullptr;
++    // opt-in until it beats the unfused kernels (GGML_METAL_HC_MIX=1)
++    static const bool disabled = getenv("GGML_METAL_HC_MIX") == nullptr || getenv("GGML_METAL_HC_MIX_DISABLE") != nullptr;
+     if (disabled) {
+         return false;
+     }
+-- 
+2.50.1 (Apple Git-155)
+

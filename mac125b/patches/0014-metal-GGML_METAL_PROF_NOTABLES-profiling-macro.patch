@@ -1,0 +1,98 @@
+From 6a7f04fe33be5cdc639b7bb8a5840023ec05ad43 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:42:54 +0900
+Subject: [PATCH 14/49] metal: GGML_METAL_PROF_NOTABLES profiling macro
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.m  |  3 +++
+ ggml/src/ggml-metal/kernels/mul_mv.metal | 21 +++++++++++++--------
+ 2 files changed, 16 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 46a8b79..54d47bf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -462,6 +462,9 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
+     }
+ #if GGML_METAL_EMBED_LIBRARY
+     [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
++    if (getenv("GGML_METAL_PROF_NOTABLES")) {
++        [prep setObject:@"1" forKey:@"GGML_METAL_PROF_NOTABLES"];
++    }
+ #endif
+ 
+ #if GGML_METAL_EMBED_LIBRARY
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index cf3a2ac..5f2eef4 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -1,4 +1,9 @@
+ #include "common.h"
++#ifdef GGML_METAL_PROF_NOTABLES
++#define GGML_PROF_NVAL(n) 0
++#else
++#define GGML_PROF_NVAL(n) (n)
++#endif
+ #include "dequantize.h"
+ // Q1_0 dot product: dot = d * (2 * Σ(yl[i] where bit=1) - sumy)
+ inline float block_q_n_dot_y(device const block_q1_0 * qb_curr, float sumy, thread float * yl, int il) {
+@@ -1917,10 +1922,10 @@ void kernel_mul_mv_iq2_xxs_f32_impl(
+     {
+         int nval = 4;
+         int pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) svalues[pos + i] = iq2xxs_grid[pos + i];
+         nval = 2;
+         pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
+@@ -2049,10 +2054,10 @@ void kernel_mul_mv_iq2_xs_f32_impl(
+     {
+         int nval = 8;
+         int pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2xs_grid[pos + i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) svalues[pos + i] = iq2xs_grid[pos + i];
+         nval = 2;
+         pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
+@@ -2193,10 +2198,10 @@ void kernel_mul_mv_iq3_xxs_f32_impl(
+     {
+         int nval = 4;
+         int pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) svalues[pos + i] = iq3xxs_grid[pos + i];
+         nval = 2;
+         pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) ssigns[pos+i] = ksigns_iq2xs[pos+i];
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
+@@ -2328,7 +2333,7 @@ void kernel_mul_mv_iq3_s_f32_impl(
+     {
+         int nval = 8;
+         int pos  = (32*sgitg + tiisg)*nval;
+-        for (int i = 0; i < nval; ++i) svalues[pos + i] = iq3s_grid[pos + i];
++        for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) svalues[pos + i] = iq3s_grid[pos + i];
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
+@@ -2464,7 +2469,7 @@ void kernel_mul_mv_iq2_s_f32_impl(
+     //{
+     //    int nval = 32;
+     //    int pos  = (32*sgitg + tiisg)*nval;
+-    //    for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2s_grid[pos + i];
++    //    for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) svalues[pos + i] = iq2s_grid[pos + i];
+     //    threadgroup_barrier(mem_flags::mem_threadgroup);
+     //}
+ 
+-- 
+2.50.1 (Apple Git-155)
+

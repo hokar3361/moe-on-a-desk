@@ -1,0 +1,162 @@
+From efe9157b024494b39d027d9ed8e718bf24bc822f Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 00:00:38 +0900
+Subject: [PATCH 23/49] speculative: EV-planned MTP depth (LLAMA_SPEC_EV=1,
+ opt-in; slower as calibrated)
+
+---
+ common/speculative.cpp | 110 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 110 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index c5043a4..eae6555 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1425,6 +1425,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // ---- EV planner (LLAMA_SPEC_EV=1) ----
++    struct ev_planner {
++        bool enabled = false;
++        std::vector<float> cost;          // verify ms for width 1..N (index = width)
++        float draft_ms = 1.5f;
++        static constexpr int NB = 20;     // probability buckets
++        float acc_n[NB];
++        float acc_k[NB];
++        uint64_t rounds = 0;
++        double sum_accepted = 0.0, sum_drafted = 0.0;
++
++        void init() {
++            const char * en = getenv("LLAMA_SPEC_EV");
++            enabled = en && atoi(en) != 0;
++            // measured on M4 Max (verify widths 1..8), ms
++            cost = { 0.0f, 21.0f, 28.8f, 31.6f, 34.3f, 37.2f, 40.1f, 43.0f, 46.0f };
++            if (const char * c = getenv("LLAMA_SPEC_EV_COST")) {
++                std::vector<float> v = { 0.0f };
++                std::string str(c);
++                size_t pos = 0;
++                while (pos < str.size()) {
++                    size_t e = str.find(',', pos);
++                    v.push_back(std::stof(str.substr(pos, e == std::string::npos ? std::string::npos : e - pos)));
++                    if (e == std::string::npos) break;
++                    pos = e + 1;
++                }
++                if (v.size() >= 3) cost = v;
++            }
++            if (const char * d = getenv("LLAMA_SPEC_EV_DRAFT_MS")) {
++                draft_ms = std::stof(d);
++            }
++            for (int b = 0; b < NB; ++b) {
++                const float pc = (b + 0.5f)/NB;   // prior: the head's own probability, weight 4
++                acc_n[b] = 4.0f;
++                acc_k[b] = 4.0f*pc;
++            }
++        }
++        static int bucket(float p) { return std::min(NB - 1, std::max(0, (int) (p*NB))); }
++        float calib(float p) const { const int b = bucket(p); return acc_k[b]/acc_n[b]; }
++        float T(int width) const {
++            if (width < (int) cost.size()) return cost[width];
++            const float slope = cost.back() - cost[cost.size() - 2];
++            return cost.back() + slope*(width - (int) cost.size() + 1);
++        }
++        // rate if the round verifies k drafted tokens after s draft steps, expected accepted E
++        float rate(float E, int k, int s) const { return E/(T(k + 1) + draft_ms*s); }
++    };
++    ev_planner ev;
++    std::vector<std::vector<float>> ev_last_p;   // calibrated-input probabilities of the last draft, per seq
++    std::vector<float> ev_P, ev_E;                // running chain acceptance and expected accepted, per seq
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
+         , params(params.draft)
+@@ -1439,6 +1490,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
++        ev.init();
++        ev_last_p.assign(n_seq, {});
++        ev_P.assign(n_seq, 1.0f);
++        ev_E.assign(n_seq, 1.0f);
++        if (ev.enabled) {
++            LOG_INF("%s: EV-planned MTP depth on (cap %d, draft %.2f ms)\n", __func__, (int) params.draft.n_max, ev.draft_ms);
++        }
+         SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
+                 this->params.n_gpu_layers,
+@@ -1687,6 +1745,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+             i_last[seq_id] = idx;
+ 
++            ev_last_p[seq_id].clear();
++            ev_P[seq_id] = 1.0f;
++            ev_E[seq_id] = 1.0f;
++
+             if (chain_heads) {
+                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+             }
+@@ -1751,6 +1813,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
++                // EV planner: include this token only if it improves expected tokens per round time
++                if (ev.enabled) {
++                    const int   k     = (int) dparams.at(seq_id).result->size();   // tokens included so far
++                    const int   steps = i + 1;                                     // draft steps spent
++                    const float a     = ev.calib(cur_p->data[0].p);
++                    const float P1    = ev_P[seq_id]*a;
++                    const float E1    = ev_E[seq_id] + P1;
++                    if (ev.rate(E1, k + 1, steps) <= ev.rate(ev_E[seq_id], k, steps)) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++                    ev_P[seq_id] = P1;
++                    ev_E[seq_id] = E1;
++                    ev_last_p[seq_id].push_back(cur_p->data[0].p);
++                    // stop early when even a certain next token could not pay for another step
++                    if (ev.rate(E1 + P1, k + 2, steps + 1) <= ev.rate(E1, k + 1, steps)) {
++                        common_sampler_accept(smpl, id, true);
++                        dparams.at(seq_id).result->push_back(id);
++                        if (dparams.at(seq_id).result_q) {
++                            dparams.at(seq_id).result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
++                        }
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++                }
++
+                 common_sampler_accept(smpl, id, true);
+ 
+                 auto & dp = dparams.at(seq_id);
+@@ -1820,6 +1910,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        if (ev.enabled && !ev_last_p[seq_id].empty()) {
++            // calibration: every drafted token up to and including the first rejection was "tried"
++            const auto & lp = ev_last_p[seq_id];
++            for (int j = 0; j < (int) lp.size() && j <= (int) n_accepted; ++j) {
++                const int b = ev_planner::bucket(lp[j]);
++                ev.acc_n[b] += 1.0f;
++                if (j < (int) n_accepted) {
++                    ev.acc_k[b] += 1.0f;
++                }
++            }
++            ev.rounds++;
++            ev.sum_accepted += n_accepted;
++            ev.sum_drafted  += lp.size();
++            if (ev.rounds % 200 == 0) {
++                LOG_INF("%s: EV rounds %llu, mean drafted %.2f, mean accepted %.2f\n", __func__,
++                        (unsigned long long) ev.rounds, ev.sum_drafted/ev.rounds, ev.sum_accepted/ev.rounds);
++            }
++            ev_last_p[seq_id].clear();
++        }
++
+         const int32_t n_rows = verify_h_rows[seq_id];
+         if (n_rows <= 0) {
+             return;
+-- 
+2.50.1 (Apple Git-155)
+

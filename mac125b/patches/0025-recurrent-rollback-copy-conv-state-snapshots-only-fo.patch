@@ -1,0 +1,48 @@
+From bccf2142e7652080a2cb810822b67ba331be8f2d Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 00:16:21 +0900
+Subject: [PATCH 25/49] recurrent rollback: copy conv-state snapshots only for
+ slots this ubatch can roll back
+
+---
+ src/models/delta-net-base.cpp | 6 ++++++
+ src/models/qwen4exp.cpp       | 3 ++-
+ 2 files changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad66126..49bc6e8 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -501,9 +501,15 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+ 
+         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+ 
++        // slots beyond the tokens of this ubatch are never read by a rollback of it
++        const int64_t n_new = conv_input->ne[0] - conv_states->ne[0];
++
+         for (int64_t t = 1; t <= K; ++t) {
+             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+             const int64_t s_slot = K - t;
++            if (s_slot >= n_new) {
++                continue;
++            }
+ 
+             ggml_tensor * conv_state_last =
+                 ggml_view_3d(ctx0, conv_input,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 42d5e01..477bbf7 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1358,7 +1358,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
+     const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+     const uint32_t mem_size = mctx_cur->get_size();
+ 
+-    const int64_t n_slots = (int64_t) cparams.n_rs_seq + 1;
++    // slots beyond the tokens of this ubatch are never read by a rollback of it
++    const int64_t n_slots = std::min<int64_t>((int64_t) cparams.n_rs_seq + 1, conv_input->ne[0] - state_cols);
+ 
+     for (int64_t slot = 0; slot < n_slots; ++slot) {
+         const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
+-- 
+2.50.1 (Apple Git-155)
+

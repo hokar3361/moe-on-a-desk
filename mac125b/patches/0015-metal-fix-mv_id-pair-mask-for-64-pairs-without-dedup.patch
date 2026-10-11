@@ -1,0 +1,51 @@
+From e064296f9c068e07027db71909bb4bf3993b5279 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:44:19 +0900
+Subject: [PATCH 15/49] metal: fix mv_id pair mask for >64 pairs without dedup;
+ dedup opt-in
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   | 5 +++--
+ ggml/src/ggml-metal/kernels/mul_mv.metal | 9 ++++-----
+ 2 files changed, 7 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index e18fc29..6928a2d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2931,9 +2931,10 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
+     return 8 + N_MM_NPART_AMAX*sizeof(float);
+ }
+ 
+-// GGML_METAL_MOE_DEDUP=0 disables reading each selected expert once per batch
++// GGML_METAL_MOE_DEDUP=1: read each selected expert once per batch (opt-in: no speedup measured on M4 Max,
++// the expert kernels are not bandwidth bound)
+ static bool ggml_metal_moe_dedup() {
+-    static const bool v = getenv("GGML_METAL_MOE_DEDUP") == nullptr || atoi(getenv("GGML_METAL_MOE_DEDUP")) != 0;
++    static const bool v = getenv("GGML_METAL_MOE_DEDUP") != nullptr && atoi(getenv("GGML_METAL_MOE_DEDUP")) != 0;
+     return v;
+ }
+ 
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 5f2eef4..9d77848 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3357,11 +3357,10 @@ kernel void kernel_mul_mv_id(
+         /*.r3   =*/ 1,
+     };
+ 
+-    if (!args.dedup) {
+-        match = 1ull << pz;
+-    }
+-    for (uint64_t m = match; m != 0; m &= m - 1) {
+-        const int q  = ctz(m);
++    // without dedup: just this pair (pz may exceed 63, so it is not put into the mask)
++    const bool single = !args.dedup;
++    for (uint64_t m = single ? 1ull : match; m != 0; m &= m - 1) {
++        const int q  = single ? pz : (int) ctz(m);
+         const int qt = q/args.nei0;
+         const int qs = q%args.nei0;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

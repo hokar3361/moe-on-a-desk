@@ -1,0 +1,6 @@
+*.bin
+*.gguf
+*.pt
+*.npz
+venv/
+__pycache__/

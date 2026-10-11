@@ -1,0 +1,567 @@
+From 0e78e81ce77c21b5a930679e405ffa5894bf58ca Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 10:34:57 +0900
+Subject: [PATCH 34/49] spec/graph: graph cache per small-batch shape
+ (LLAMA_GRAPH_CACHE), delayed frees in the graph allocator
+ (GGML_ALLOC_FREE_DELAY), MTP catch-up merged into the first draft step
+ (LLAMA_SPEC_MTP_MERGE), depth controller reset per request and
+ acceptance-driven exploration, bf16 MMA from 2 rows
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp                    | 116 +++++++++++++++++++++-
+ ggml/src/ggml-alloc.c                     |  42 +++++++-
+ ggml/src/ggml-metal/ggml-metal-common.cpp |  14 ++-
+ ggml/src/ggml-metal/ggml-metal-context.m  |   4 +-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  25 ++++-
+ ggml/src/ggml-metal/ggml-metal-ops.h      |   2 +
+ src/llama-context.cpp                     |  80 ++++++++++++++-
+ src/llama-context.h                       |  13 +++
+ 8 files changed, 286 insertions(+), 10 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 099ea2b..17365a9 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1425,6 +1425,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // merged catch-up (LLAMA_SPEC_MTP_MERGE=1): the catch-up over a verify batch is deferred to the next draft() and
++    // decoded together with the first draft step, over the accepted tokens only
++    bool merge = false;
++    std::vector<bool>                   gen;        // a draft() ran since begin()
++    std::vector<bool>                   def_valid;
++    std::vector<llama_tokens>           def_tok;
++    std::vector<std::vector<llama_pos>> def_pos;
++    std::vector<std::vector<float>>     def_h0;     // pending_h at process() time, pairs with def_tok[0]
++    std::vector<int32_t>                def_nacc;
++
++    // run a deferred catch-up on its own (accepted prefix)
++    void mtp_flush(llama_seq_id s) {
++        def_valid[s] = false;
++        const int n = std::min<int>((int) def_tok[s].size(), def_nacc[s] + 1);
++        if (n <= 0) {
++            return;
++        }
++        batch.clear();
++        for (int k = 0; k < n; ++k) {
++            const int32_t idx = batch.add(def_tok[s][k], def_pos[s][k], s, false);
++            const float * h_row = k == 0 ? def_h0[s].data() : verify_h[s].data() + (size_t) (k - 1)*n_embd;
++            batch.set_embd_state(idx, { h_row, 1, (size_t) n_embd });
++        }
++        const int32_t rc = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
++        if (rc != 0) {
++            SPC_ERR("deferred catch-up failed rc=%d\n", (int) rc);
++        }
++        batch.clear();
++    }
++
+     // ---- EV planner (LLAMA_SPEC_EV=1) ----
+     struct ev_planner {
+         bool enabled = false;
+@@ -1694,6 +1724,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         verify_h.assign(n_seq, {});
+         verify_h_rows.assign(n_seq, 0);
++
++        merge = getenv("LLAMA_SPEC_MTP_MERGE") && atoi(getenv("LLAMA_SPEC_MTP_MERGE")) != 0 && !chain_heads && !is_mem_shared;
++        gen.assign(n_seq, false);
++        def_valid.assign(n_seq, false);
++        def_tok.assign(n_seq, {});
++        def_pos.assign(n_seq, {});
++        def_h0.assign(n_seq, {});
++        def_nacc.assign(n_seq, 0);
++        if (merge) {
++            LOG_INF("%s: MTP catch-up merged into the first draft step\n", __func__);
++        }
+     }
+ 
+     ~common_speculative_impl_draft_mtp() override {
+@@ -1714,6 +1755,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // reset here rather than per round, or two identical requests differ
+         common_sampler_reset(smpls[seq_id].get());
+ 
++        if (merge) {
++            gen[seq_id]       = false;
++            def_valid[seq_id] = false;
++        }
++
++        // LLAMA_SPEC_DEPTH_RESET=1: the depth controller starts from its priors for every request
++        if (dctl.enabled && getenv("LLAMA_SPEC_DEPTH_RESET") && atoi(getenv("LLAMA_SPEC_DEPTH_RESET")) != 0) {
++            dctl.init(params.n_max);
++        }
++
+         const int32_t N = (int32_t) prompt.size();
+         if (N <= 0) {
+             return;
+@@ -1762,8 +1813,33 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+ 
++        // merged catch-up: during generation stash the verify batch, the catch-up runs in the next draft()
++        bool deferred = false;
++        if (merge && batch_in.has_token() && !batch_in.has_embd() && n_tokens <= 16) {
++            const llama_seq_id s0 = batch_in.tokens[0].seq_id;
++            bool one_seq = s0 >= 0 && s0 < (llama_seq_id) n_seq;
++            for (int k = 0; k < n_tokens && one_seq; ++k) {
++                one_seq = batch_in.tokens[k].seq_id == s0 && batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
++            }
++            if (one_seq && gen[s0]) {
++                if (def_valid[s0]) {
++                    mtp_flush(s0);
++                }
++                def_tok[s0].clear();
++                def_pos[s0].clear();
++                for (int k = 0; k < n_tokens; ++k) {
++                    def_tok[s0].push_back(batch_in.tokens[k].id);
++                    def_pos[s0].push_back(batch_in.tokens[k].pos[0]);
++                }
++                def_h0[s0]    = pending_h[s0];
++                def_nacc[s0]  = n_tokens - 1;
++                def_valid[s0] = true;
++                deferred = true;
++            }
++        }
++
+         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
+-        if (!is_mem_shared) {
++        if (!is_mem_shared && !deferred) {
+             batch.clear();
+ 
+             // pair each token with the tgt embedding shifted right by one position, and
+@@ -1895,7 +1971,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+             if (d != dctl.depth) { dctl.depth = d; dctl.rounds_at = 0; }
+             dctl.exploring = false;
+-            if (++dctl.rounds_at % 16 == 0 && dctl.depth < dctl.cap) {
++            // explore one deeper: often when the last drafted position is usually accepted, rarely otherwise
++            // (LLAMA_SPEC_DEPTH_FASTX=0 keeps the fixed period of 16)
++            static const bool fastx = !getenv("LLAMA_SPEC_DEPTH_FASTX") || atoi(getenv("LLAMA_SPEC_DEPTH_FASTX")) != 0;
++            const float ad = dctl.a[dctl.depth];
++            const int period = !fastx ? 16 : ad >= 0.80f ? 2 : ad >= 0.65f ? 8 : 32;
++            if (++dctl.rounds_at % period == 0 && dctl.depth < dctl.cap) {
+                 dctl.exploring = true;
+             }
+             mtp_depth = dctl.exploring ? dctl.depth + 1 : dctl.depth;
+@@ -1903,6 +1984,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             dctl.last_depth = mtp_depth;
+         }
+ 
++        if (merge) {
++            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
++                const auto & dp = dparams[seq_id];
++                if (!def_valid[seq_id]) {
++                    continue;
++                }
++                const int n = std::min<int>((int) def_tok[seq_id].size(), def_nacc[seq_id] + 1);
++                if (!dp.drafting || n <= 0 || def_pos[seq_id][n - 1] + 1 != dp.pos0) {
++                    mtp_flush(seq_id);
++                }
++            }
++        }
++
+         batch.clear();
+ 
+         // keep track of which sequences are still drafting
+@@ -1953,6 +2047,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+             }
+ 
++            if (merge) {
++                gen[seq_id] = true;
++                if (def_valid[seq_id]) {
++                    // the accepted prefix of the last verify batch, then the new token: one decode
++                    def_valid[seq_id] = false;
++                    const int n = std::min<int>((int) def_tok[seq_id].size(), def_nacc[seq_id] + 1);
++                    for (int k = 0; k < n; ++k) {
++                        const int32_t ik = batch.add(def_tok[seq_id][k], def_pos[seq_id][k], seq_id, false);
++                        const float * h_row = k == 0 ? def_h0[seq_id].data() : verify_h[seq_id].data() + (size_t) (k - 1)*n_embd;
++                        batch.set_embd_state(ik, { h_row, 1, (size_t) n_embd });
++                    }
++                }
++            }
++
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+@@ -2158,6 +2266,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        if (merge && def_valid[seq_id]) {
++            def_nacc[seq_id] = n_accepted;
++        }
++
+         if (dctl.enabled) {
+             dctl.last_acc = n_accepted;
+         }
+diff --git a/ggml/src/ggml-alloc.c b/ggml/src/ggml-alloc.c
+index b0c067b..5727a2b 100644
+--- a/ggml/src/ggml-alloc.c
++++ b/ggml/src/ggml-alloc.c
+@@ -629,7 +629,11 @@ static void ggml_gallocr_allocate_node(ggml_gallocr_t galloc, struct ggml_tensor
+         assert(hn->addr.offset == 0);
+ 
+         // try to reuse a parent's buffer (inplace)
+-        if (ggml_op_can_inplace(node->op)) {
++        static int no_inplace = -1;
++        if (no_inplace < 0) {
++            no_inplace = getenv("GGML_ALLOC_NO_INPLACE") != NULL;
++        }
++        if (!no_inplace && ggml_op_can_inplace(node->op)) {
+             for (int i = 0; i < GGML_MAX_SRC; i++) {
+                 struct ggml_tensor * parent = node->src[i];
+                 if (parent == NULL) {
+@@ -760,11 +764,32 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+         }
+     }
+ 
++    // delayed frees (GGML_ALLOC_FREE_DELAY): released K nodes after the last consumer
++    static int free_delay = -1;
++    if (free_delay < 0) {
++        const char * env = getenv("GGML_ALLOC_FREE_DELAY");
++        free_delay = env ? atoi(env) : 0;
++    }
++    struct ggml_tensor ** pend_t = NULL;
++    int * pend_at = NULL;
++    int n_pend = 0, n_pend_head = 0;
++    if (free_delay > 0) {
++        pend_t  = (struct ggml_tensor **) malloc(sizeof(struct ggml_tensor *) * (graph->n_nodes*GGML_MAX_SRC + 1));
++        pend_at = (int *) malloc(sizeof(int) * (graph->n_nodes*GGML_MAX_SRC + 1));
++    }
++
+     // allocate tensors
+     for (int i = 0; i < graph->n_nodes; i++) {
+         struct ggml_tensor * node = graph->nodes[i];
+         int buffer_id = get_node_buffer_id(node_buffer_ids, i);
+ 
++        while (n_pend_head < n_pend && pend_at[n_pend_head] <= i) {
++            struct ggml_tensor * t = pend_t[n_pend_head++];
++            if (ggml_gallocr_hash_get(galloc, t)->allocated) {
++                ggml_gallocr_free_node(galloc, t);
++            }
++        }
++
+         // allocate parents (only leafs need to be allocated at this point)
+         for (int j = 0; j < GGML_MAX_SRC; j++) {
+             struct ggml_tensor * parent = node->src[j];
+@@ -810,16 +835,27 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
+                     AT_PRINTF("view_src %s: %d children, %d views\n",
+                         view_src->name, view_src_hn->n_children, view_src_hn->n_views);
+                     if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src_hn->allocated) {
+-                        ggml_gallocr_free_node(galloc, view_src);
++                        if (free_delay > 0) {
++                            pend_t[n_pend] = view_src; pend_at[n_pend] = i + free_delay; n_pend++;
++                        } else {
++                            ggml_gallocr_free_node(galloc, view_src);
++                        }
+                     }
+                 }
+                 else if (p_hn->allocated) {
+-                    ggml_gallocr_free_node(galloc, parent);
++                    if (free_delay > 0) {
++                        pend_t[n_pend] = parent; pend_at[n_pend] = i + free_delay; n_pend++;
++                    } else {
++                        ggml_gallocr_free_node(galloc, parent);
++                    }
+                 }
+             }
+             AT_PRINTF("\n");
+         }
+     }
++
++    free(pend_t);
++    free(pend_at);
+ }
+ 
+ static bool ggml_gallocr_reserve_n_impl(
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.cpp b/ggml/src/ggml-metal/ggml-metal-common.cpp
+index 206f362..28bfe0b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -1,4 +1,5 @@
+ #include <cstdlib>
++#include <cstring>
+ #include "ggml-metal-common.h"
+ #include "ggml-metal-fusion.h"
+ 
+@@ -121,13 +122,24 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
+ 
+ // the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured on an M3 Ultra)
+ static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
++    // diagnostic override: GGML_METAL_MMA_MIN=bf16:2,q4_K:2
++    static const char * env = getenv("GGML_METAL_MMA_MIN");
++    if (env) {
++        const char * tn = ggml_type_name(type);
++        const size_t l = strlen(tn);
++        for (const char * p = strstr(env, tn); p; p = strstr(p + 1, tn)) {
++            if ((p == env || p[-1] == ',') && p[l] == ':') {
++                return atoi(p + l + 1);
++            }
++        }
++    }
+     switch (type) {
+         case GGML_TYPE_F32:
+             return 6;
+         case GGML_TYPE_TQ2_0:
+             return 5;
+         case GGML_TYPE_BF16:
+-            return 4;
++            return 2; // M4 Max: the MMA kernel is faster from 2 rows (B=3 verify pass 33.9 -> 30.3 ms); was 4 (M3 Ultra)
+         case GGML_TYPE_F16:
+         case GGML_TYPE_Q2_0:
+         case GGML_TYPE_Q4_K:
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index aae6f8a..fc0d61a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -335,10 +335,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+             }
+             gsum += s1 - s0;
+         }
+-        fprintf(stderr, "metal-timing: nodes=%d n_cb=%d encode=%.3f gpu_span=%.3f gpu_sum=%.3f first_gpu=%.3f wall=%.3f ms t=%.3f\n",
++        fprintf(stderr, "metal-timing: nodes=%d n_cb=%d encode=%.3f gpu_span=%.3f gpu_sum=%.3f first_gpu=%.3f wall=%.3f ms t=%.3f nbar=%d\n",
+                 ctx->t_nodes, ctx->n_cb,
+                 1e3*(ctx->t_encoded - ctx->t_submit), 1e3*(g1 - g0), 1e3*gsum,
+-                1e3*(g0 - ctx->t_submit), 1e3*(t_done - ctx->t_submit), 1e3*ctx->t_submit);
++                1e3*(g0 - ctx->t_submit), 1e3*(t_done - ctx->t_submit), 1e3*ctx->t_submit, ggml_metal_op_nbar_take());
+         ctx->t_submit = 0.0;
+     }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 9daf07b..afb35c2 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1,3 +1,4 @@
++#include <atomic>
+ #include "ggml-metal-ops.h"
+ 
+ #include "ggml.h"
+@@ -75,6 +76,10 @@ struct ggml_metal_op {
+         ggml_mem_ranges_free(this->mem_ranges);
+     }
+ 
++    int n_nodes_graph() const {
++        return ggml_graph_n_nodes(gf);
++    }
++
+     int n_nodes() const {
+         return idxs.size();
+     }
+@@ -233,6 +238,12 @@ static bool ggml_metal_prof_skip(const ggml_tensor * node) {
+     return list.find(key0) != std::string::npos || list.find(key1) != std::string::npos;
+ }
+ 
++static std::atomic<int> g_metal_nbar{0};
++
++int ggml_metal_op_nbar_take(void) {
++    return g_metal_nbar.exchange(0);
++}
++
+ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+     if (!ctx->mem_ranges) {
+         return true;
+@@ -240,6 +251,7 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+ 
+     if (!ggml_metal_prof_nobarrier()) {
+         ggml_metal_encoder_memory_barrier(ctx->enc);
++        g_metal_nbar++;
+     }
+ 
+     ggml_mem_ranges_reset(ctx->mem_ranges);
+@@ -339,6 +351,11 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+ 
+         if (!is_concurrent) {
+             ggml_metal_op_concurrency_reset(ctx);
++            // GGML_METAL_PROF_BARLOG: the node that forced each barrier, in graphs with > 5000 nodes
++            static const bool barlog = getenv("GGML_METAL_PROF_BARLOG") != nullptr;
++            if (barlog && ctx->n_nodes_graph() > 5000) {
++                fprintf(stderr, "barlog %s %s\n", ggml_op_desc(node), ggml_get_name(node));
++            }
+         }
+ 
+         if (ctx->debug_graph > 0) {
+@@ -2751,6 +2768,12 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++// smallest batch that uses the few-token kernels for K-quants (GGML_METAL_KQ_EXT_MIN, diagnostic)
++static int ggml_metal_kq_ext_min() {
++    static const int v = getenv("GGML_METAL_KQ_EXT_MIN") ? atoi(getenv("GGML_METAL_KQ_EXT_MIN")) : 4;
++    return v;
++}
++
+ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+@@ -2809,7 +2832,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
+            op->src[0]->type == GGML_TYPE_Q6_K ||
+            op->src[0]->type == GGML_TYPE_Q2_K ||
+            op->src[0]->type == GGML_TYPE_Q3_K ||
+-           false) && (ne11 >= 4 && ne11 <= 8)
++           false) && (ne11 >= ggml_metal_kq_ext_min() && ne11 <= 8)
+          )
+         )
+        ) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.h b/ggml/src/ggml-metal/ggml-metal-ops.h
+index 583d115..4380913 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.h
++++ b/ggml/src/ggml-metal/ggml-metal-ops.h
+@@ -23,6 +23,8 @@ ggml_metal_op_t ggml_metal_op_init(
+ 
+ void ggml_metal_op_free(ggml_metal_op_t ctx);
+ 
++int ggml_metal_op_nbar_take(void);
++
+ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
+ 
+ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7e69744..aa421bb 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -641,6 +641,8 @@ void llama_context::sched_reserve() {
+ 
+     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
+ 
++    graph_cache.clear();
++
+     for (auto & res : gf_res_prev) {
+         res.reset();
+     }
+@@ -1443,9 +1445,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         ggml_backend_sched_reset(sched.get());
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+-        //const auto t_start_us = ggml_time_us();
++        const auto t_start_us = ggml_time_us();
+ 
+         gf = model.build_graph(gparams);
++        const auto t_built_us = ggml_time_us();
+ 
+         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+ 
+@@ -1461,6 +1464,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+             return nullptr;
+         }
+ 
++        if (getenv("LLAMA_GRAPH_TIME")) {
++            size_t tot = 0;
++            for (size_t ib = 0; ib < backend_ptrs.size(); ++ib) {
++                tot += ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[ib]);
++            }
++            fprintf(stderr, "graph sched buffers: %.1f MiB (cache entries %zu)\n", tot/1048576.0, graph_cache.size());
++            fprintf(stderr, "graph rebuild: n_tokens %d nodes %d build %.3f ms alloc %.3f ms\n", (int) ubatch.n_tokens, ggml_graph_n_nodes(gf),
++                    (t_built_us - t_start_us)/1000.0, (ggml_time_us() - t_built_us)/1000.0);
++        }
++
+         gf_res_prev_active = res;
+     }
+ 
+@@ -1904,6 +1917,36 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+         ggml_status status;
+ 
++        struct graph_cache_swap {
++            llama_context * ctx;
++            llama_context::graph_cache_entry * e;
++            int slot;
++            graph_cache_swap(llama_context * ctx, llama_context::graph_cache_entry * e, int slot) : ctx(ctx), e(e), slot(slot) {
++                if (!e) {
++                    return;
++                }
++                std::swap(ctx->sched, e->sched);
++                std::swap(ctx->gf_res_prev[slot], e->res);
++                std::swap(ctx->gf_res_prev_active, e->active_ptr);
++            }
++            ~graph_cache_swap() {
++                if (!e) {
++                    return;
++                }
++                std::swap(ctx->sched, e->sched);
++                std::swap(ctx->gf_res_prev[slot], e->res);
++                std::swap(ctx->gf_res_prev_active, e->active_ptr);
++            }
++        };
++
++        llama_context::graph_cache_entry * gce = nullptr;
++        if (ubatch.n_tokens <= 16 && ubatch.n_seqs_unq == 1) {
++            const uint64_t key = (uint64_t) ubatch.n_tokens | ((uint64_t) n_outputs << 8) | ((uint64_t) ctx_type_to_graph_type(cparams.ctx_type) << 16) |
++                                 ((uint64_t) (ubatch.embd != nullptr) << 24);
++            gce = graph_cache_get(key);
++        }
++        graph_cache_swap gcs(this, gce, n_outputs > 0);
++
+         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+ 
+         if (!res) {
+@@ -2458,6 +2501,41 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
+     return static_cast<llm_graph_result *>(gf_res_reserve.get());
+ }
+ 
++llama_context::graph_cache_entry * llama_context::graph_cache_get(uint64_t key) {
++    if (graph_cache_max < 0) {
++        const char * env = getenv("LLAMA_GRAPH_CACHE");
++        graph_cache_max = env ? atoi(env) : 0;
++    }
++    if (graph_cache_max <= 0) {
++        return nullptr;
++    }
++    for (auto & e : graph_cache) {
++        if (e.key == key) {
++            e.last_use = ++graph_cache_tick;
++            return &e;
++        }
++    }
++    graph_cache_entry * e = nullptr;
++    if ((int) graph_cache.size() < graph_cache_max) {
++        graph_cache.emplace_back();
++        e = &graph_cache.back();
++    } else {
++        e = &graph_cache[0];
++        for (auto & x : graph_cache) {
++            if (x.last_use < e->last_use) {
++                e = &x;
++            }
++        }
++    }
++    e->key      = key;
++    e->last_use = ++graph_cache_tick;
++    e->active_ptr = nullptr;
++    e->res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
++    e->sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), gf_res_reserve->get_max_nodes(), false, cparams.op_offload));
++    ggml_backend_sched_set_copy_callback(e->sched.get(), sched_copy_experts, this);
++    return e;
++}
++
+ llm_graph_result * llama_context::get_gf_res_prev() {
+     auto & res = gf_res_prev[n_outputs > 0];
+     if (!res) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 69bc01c..d07894a 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -402,6 +402,19 @@ private:
+ 
+     llm_graph_result * gf_res_prev_active = nullptr;
+ 
++    // graph cache (LLAMA_GRAPH_CACHE): per small-batch shape, a scheduler with its allocated graph
++    struct graph_cache_entry {
++        uint64_t key      = 0;
++        uint64_t last_use = 0;
++        llm_graph_result * active_ptr = nullptr; // == res.get() when res is the graph allocated in sched
++        ggml_backend_sched_ptr sched;
++        llm_graph_result_ptr   res;
++    };
++    std::vector<graph_cache_entry> graph_cache;
++    uint64_t graph_cache_tick = 0;
++    int      graph_cache_max  = -1;
++    graph_cache_entry * graph_cache_get(uint64_t key);
++
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+ 
+-- 
+2.50.1 (Apple Git-155)
+

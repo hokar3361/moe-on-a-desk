@@ -1,0 +1,286 @@
+From 99415bf2d7c7b91ebb8e001dead862b5b04f3157 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 23:24:07 +0900
+Subject: [PATCH 19/49] metal: grouped MoE matvec (opt-in, slower than stock),
+ dispatch profiling with tensor names
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  12 +++
+ ggml/src/ggml-metal/ggml-metal-device.h   |   1 +
+ ggml/src/ggml-metal/ggml-metal-device.m   |   4 +-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  67 ++++++++++++-
+ ggml/src/ggml-metal/kernels/mul_mv.metal  | 112 ++++++++++++++++++++++
+ 5 files changed, 193 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 96237e7..e7b95b0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -547,6 +547,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_grp(ggml_metal_library_t lib, ggml_type type) {
++    char name[128];
++    snprintf(name, sizeof(name), "kernel_mul_mv_id_grp_%s", ggml_type_name(type));
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_prof_ids(ggml_metal_library_t lib) {
+     const char * name = "kernel_prof_ids";
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 7910c70..bcd2041 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -137,6 +137,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc_mix_bf16       (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_prof_ids          (ggml_metal_library_t lib);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_grp     (ggml_metal_library_t lib, enum ggml_type type);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 2468d57..e918bbe 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -890,7 +890,7 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
+ }
+ 
+ #define PROF_DISP_MAX 512
+-static struct { char op[48]; int tpt; uint64_t n, tgs; } g_disp[PROF_DISP_MAX];
++static struct { char op[96]; int tpt; uint64_t n, tgs; } g_disp[PROF_DISP_MAX];
+ static int g_disp_n = 0;
+ static const char * g_disp_op = "?";
+ static uint64_t g_disp_graphs = 0;
+@@ -900,7 +900,7 @@ static void ggml_metal_prof_dispatch_report(void) {
+     fprintf(stderr, "prof-dispatch: per graph (graphs=%llu)\n", (unsigned long long) g_disp_graphs);
+     for (int i = 0; i < g_disp_n; ++i) {
+         const double g = g_disp_graphs ? (double) g_disp_graphs : 1.0;
+-        fprintf(stderr, "prof-dispatch: %-24s tpt=%5d dispatches=%8.1f threadgroups=%10.1f avg_tg=%8.1f\n",
++        fprintf(stderr, "prof-dispatch: %-48s tpt=%5d dispatches=%8.1f threadgroups=%10.1f avg_tg=%8.1f\n",
+                 g_disp[i].op, g_disp[i].tpt, g_disp[i].n/g, g_disp[i].tgs/g, (double) g_disp[i].tgs/g_disp[i].n);
+     }
+ }
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 8e78c66..eb7a251 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -288,7 +288,18 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         return 1;
+     }
+ 
+-    ggml_metal_prof_dispatch_set_op(ggml_op_desc(node));
++    {
++        // profiling key: op, src0 type, node name without the layer suffix
++        static thread_local char key[96];
++        char nm[48];
++        snprintf(nm, sizeof(nm), "%s", node->name);
++        for (int k = (int) strlen(nm) - 1; k > 0; --k) {
++            if (nm[k] == '-') { nm[k] = 0; break; }
++            if (nm[k] < '0' || nm[k] > '9') break;
++        }
++        snprintf(key, sizeof(key), "%s.%s.%s", ggml_op_desc(node), node->src[0] ? ggml_type_name(node->src[0]->type) : "-", nm);
++        ggml_metal_prof_dispatch_set_op(key);
++    }
+ 
+     int n_fuse = 1;
+ 
+@@ -2945,6 +2956,24 @@ static bool ggml_metal_moe_dedup() {
+     return v;
+ }
+ 
++// grouped MoE matvec for a few tokens (GGML_METAL_MOE_GRP=1)
++static bool ggml_metal_moe_grp_ok(const ggml_tensor * op, int64_t ne20, int64_t ne21) {
++    static const bool en = getenv("GGML_METAL_MOE_GRP") != nullptr && atoi(getenv("GGML_METAL_MOE_GRP")) != 0;
++    if (!en || ne21 > 8 || ne20*ne21 > 96) {
++        return false;
++    }
++    if (op->src[1]->type != GGML_TYPE_F32 || op->src[0]->ne[0] % 16 != 0) {
++        return false;
++    }
++    switch (op->src[0]->type) {
++        case GGML_TYPE_IQ4_NL: case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ3_XXS: case GGML_TYPE_IQ2_XXS:
++        case GGML_TYPE_IQ2_XS: case GGML_TYPE_IQ2_S: case GGML_TYPE_Q2_0:
++            return true;
++        default:
++            return false;
++    }
++}
++
+ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+@@ -3111,6 +3140,42 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+         }
++    } else if (ggml_metal_moe_grp_ok(op, ne20, ne21)) {
++        auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id_grp(lib, op->src[0]->type);
++
++        ggml_metal_kargs_mul_mv_id args = {
++            /*.nei0 =*/ ne20,
++            /*.nei1 =*/ ne21,
++            /*.nbi1 =*/ nb21,
++            /*.ne00 =*/ ne00,
++            /*.ne01 =*/ ne01,
++            /*.ne02 =*/ ne02,
++            /*.nb00 =*/ nb00,
++            /*.nb01 =*/ nb01,
++            /*.nb02 =*/ nb02,
++            /*.ne10 =*/ ne10,
++            /*.ne11 =*/ ne11,
++            /*.ne12 =*/ ne12,
++            /*.ne13 =*/ ne13,
++            /*.nb10 =*/ nb10,
++            /*.nb11 =*/ nb11,
++            /*.nb12 =*/ nb12,
++            /*.ne0  =*/ ne0,
++            /*.ne1  =*/ ne1,
++            /*.nb1  =*/ nb1,
++            /*.nr0  =*/ 0,
++            /*.dedup =*/ 0,
++        };
++
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
++        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
++        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
++        ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
++
++        const int rows_per_tg = 4*2;
++        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows_per_tg - 1)/rows_per_tg, 1, ne20*ne21, 32, 2, 1);
+     } else {
+         if (ggml_metal_prof_ids_enabled() && ne21 > 1) {
+             static const ggml_tensor * last_ids = nullptr;
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 9d77848..4aa5c28 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3424,3 +3424,115 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
+ template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
+ template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
+ template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
++
++// ---- grouped MoE matvec (few tokens) ---------------------------------------------------------
++// grid: x = row blocks of MOE_GRP_R*MOE_GRP_NSG rows, z = (token, slot) pairs; the threadgroup of
++// the first pair selecting an expert owns it and computes it for every token that selected it.
++#define MOE_GRP_R    4
++#define MOE_GRP_NSG  2
++#define MOE_GRP_TMAX 8
++
++template <typename block_q, short nl, void (*deq)(device const block_q *, short, thread float4x4 &)>
++kernel void kernel_mul_mv_id_grp(
++        constant ggml_metal_kargs_mul_mv_id & args,
++        device const char * src0s,
++        device const char * src1,
++        device       char * dst,
++        device const char * ids,
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    const int pz      = tgpig.z;
++    const int n_pairs = args.nei0*args.nei1;
++
++    // ids of up to 96 pairs, three per lane
++    int32_t e[3];
++    FOR_UNROLL (short k = 0; k < 3; ++k) {
++        const int p = tiisg + 32*k;
++        e[k] = p < n_pairs ? ((device const int32_t *) (ids + (p/args.nei0)*args.nbi1))[p%args.nei0] : -1;
++    }
++    const int32_t ex = ((device const int32_t *) (ids + (pz/args.nei0)*args.nbi1))[pz%args.nei0];
++
++    uint m[3];
++    FOR_UNROLL (short k = 0; k < 3; ++k) {
++        m[k] = (uint) (uint64_t) simd_ballot(e[k] == ex);
++    }
++    // earlier pair with the same expert -> not the owner
++    {
++        const int w = pz/32, b = pz%32;
++        bool earlier = false;
++        FOR_UNROLL (short k = 0; k < 3; ++k) {
++            const uint lower = k < w ? 0xffffffffu : (k == w ? ((1u << b) - 1u) : 0u);
++            earlier = earlier || (m[k] & lower) != 0;
++        }
++        if (earlier) {
++            return;
++        }
++    }
++
++    // pairs (token, slot) using this expert, in order
++    short nm = 0;
++    int qt[MOE_GRP_TMAX];
++    int qs[MOE_GRP_TMAX];
++    FOR_UNROLL (short k = 0; k < 3; ++k) {
++        for (uint mm = m[k]; mm != 0 && nm < MOE_GRP_TMAX; mm &= mm - 1) {
++            const int q = 32*k + ctz(mm);
++            qt[nm] = q/args.nei0;
++            qs[nm] = q%args.nei0;
++            nm++;
++        }
++    }
++
++    const int row0 = (tgpig.x*MOE_GRP_NSG + sgitg)*MOE_GRP_R;
++    if (row0 >= args.ne01) {
++        return;
++    }
++
++    device const char * w0 = src0s + ex*args.nb02 + row0*args.nb01;
++
++    float acc[MOE_GRP_R][MOE_GRP_TMAX];
++    FOR_UNROLL (short r = 0; r < MOE_GRP_R; ++r) {
++        FOR_UNROLL (short t = 0; t < MOE_GRP_TMAX; ++t) {
++            acc[r][t] = 0.0f;
++        }
++    }
++
++    const int nch = args.ne00/16;   // 16-value chunks per row
++    for (int c = tiisg; c < nch; c += 32) {
++        const int   ib = c / nl;
++        const short il = c % nl;
++
++        float4x4 wv[MOE_GRP_R];
++        FOR_UNROLL (short r = 0; r < MOE_GRP_R; ++r) {
++            deq(((device const block_q *) (w0 + r*args.nb01)) + ib, il, wv[r]);
++        }
++
++        for (short t = 0; t < nm; ++t) {
++            device const float4 * y = (device const float4 *) (src1 + (qs[t] % args.ne11)*args.nb11 + qt[t]*args.nb12) + 4*c;
++            const float4 y0 = y[0], y1 = y[1], y2 = y[2], y3 = y[3];
++            FOR_UNROLL (short r = 0; r < MOE_GRP_R; ++r) {
++                acc[r][t] += dot(wv[r][0], y0) + dot(wv[r][1], y1) + dot(wv[r][2], y2) + dot(wv[r][3], y3);
++            }
++        }
++    }
++
++    for (short t = 0; t < nm; ++t) {
++        device float * d = (device float *) (dst + (qs[t]*args.ne0 + qt[t]*args.ne1*args.ne0)*sizeof(float));
++        FOR_UNROLL (short r = 0; r < MOE_GRP_R; ++r) {
++            const float s = simd_sum(acc[r][t]);
++            if (tiisg == 0 && row0 + r < args.ne01) {
++                d[row0 + r] = s;
++            }
++        }
++    }
++}
++
++typedef decltype(kernel_mul_mv_id_grp<block_iq4_nl, 2, dequantize_iq4_nl>) kernel_mul_mv_id_grp_t;
++
++template [[host_name("kernel_mul_mv_id_grp_iq4_nl")]]  kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq4_nl,  2,  dequantize_iq4_nl>;
++template [[host_name("kernel_mul_mv_id_grp_iq3_s")]]   kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq3_s,   16, dequantize_iq3_s>;
++template [[host_name("kernel_mul_mv_id_grp_iq3_xxs")]] kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq3_xxs, 16, dequantize_iq3_xxs>;
++template [[host_name("kernel_mul_mv_id_grp_iq2_xxs")]] kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq2_xxs, 16, dequantize_iq2_xxs>;
++template [[host_name("kernel_mul_mv_id_grp_iq2_xs")]]  kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq2_xs,  16, dequantize_iq2_xs>;
++template [[host_name("kernel_mul_mv_id_grp_iq2_s")]]   kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq2_s,   16, dequantize_iq2_s>;
++template [[host_name("kernel_mul_mv_id_grp_q2_0")]]    kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_q2_0,    4,  dequantize_q2_0>;
+-- 
+2.50.1 (Apple Git-155)
+

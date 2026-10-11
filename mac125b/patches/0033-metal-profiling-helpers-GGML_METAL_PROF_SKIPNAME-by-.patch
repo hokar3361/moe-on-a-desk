@@ -1,0 +1,57 @@
+From 47fdcfc1d275f719a698a98218dfcc0d15ceae83 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 09:55:38 +0900
+Subject: [PATCH 33/49] metal: profiling helpers (GGML_METAL_PROF_SKIPNAME by
+ node name, absolute submit time in metal-timing)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-context.m |  4 ++--
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   | 14 ++++++++++++++
+ 2 files changed, 16 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index 44b6408..aae6f8a 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -335,10 +335,10 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+             }
+             gsum += s1 - s0;
+         }
+-        fprintf(stderr, "metal-timing: nodes=%d n_cb=%d encode=%.3f gpu_span=%.3f gpu_sum=%.3f first_gpu=%.3f wall=%.3f ms\n",
++        fprintf(stderr, "metal-timing: nodes=%d n_cb=%d encode=%.3f gpu_span=%.3f gpu_sum=%.3f first_gpu=%.3f wall=%.3f ms t=%.3f\n",
+                 ctx->t_nodes, ctx->n_cb,
+                 1e3*(ctx->t_encoded - ctx->t_submit), 1e3*(g1 - g0), 1e3*gsum,
+-                1e3*(g0 - ctx->t_submit), 1e3*(t_done - ctx->t_submit));
++                1e3*(g0 - ctx->t_submit), 1e3*(t_done - ctx->t_submit), 1e3*ctx->t_submit);
+         ctx->t_submit = 0.0;
+     }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 1272a94..9daf07b 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -208,6 +208,20 @@ static bool ggml_metal_prof_nobarrier() {
+ 
+ // GGML_METAL_PROF_SKIP: comma separated op descriptions, optionally with ".<src0 type>"
+ static bool ggml_metal_prof_skip(const ggml_tensor * node) {
++    // GGML_METAL_PROF_SKIPNAME: comma separated substrings of node names
++    static const char * envn = getenv("GGML_METAL_PROF_SKIPNAME");
++    if (envn) {
++        std::string list(envn);
++        size_t a = 0;
++        while (a <= list.size()) {
++            size_t b = list.find(',', a);
++            if (b == std::string::npos) b = list.size();
++            if (b > a && strstr(node->name, list.substr(a, b - a).c_str())) {
++                return true;
++            }
++            a = b + 1;
++        }
++    }
+     static const char * env = getenv("GGML_METAL_PROF_SKIP");
+     if (!env) {
+         return false;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,141 @@
+From aff423f428733e82666c385ccbef905d74cd29c6 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:24:22 +0900
+Subject: [PATCH 09/49] metal: hc mix v5 + profiling bits
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp |  2 +-
+ ggml/src/ggml-metal/kernels/misc.metal | 67 +++++++++++++++++---------
+ 2 files changed, 45 insertions(+), 24 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index af00193..fd36c2f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4536,7 +4536,7 @@ static int ggml_metal_op_hc_mix(ggml_metal_op_t ctx, int idx, int n_fuse) {
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(pre),          7);
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_device_get_sync_buffer(ctx->dev), 8);
+ 
+-    ggml_metal_encoder_set_threadgroup_memory_size(enc, std::max<size_t>(args.n_lo, x->ne[0])*sizeof(float), 0);
++    ggml_metal_encoder_set_threadgroup_memory_size(enc, (std::max<size_t>(args.n_lo, x->ne[0]) + 16)*sizeof(float), 0);
+     ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, 32*8, 1, 1);
+ 
+     return n_fuse;
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 8902e39..f282538 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -788,19 +788,47 @@ kernel void kernel_hc_mix_bf16(
+             }
+         }
+ 
+-        // y = x*w_norm for this threadgroup's segments
+-        for (int e = tid; e < (kh - kl + 1)*seg; e += 32*HC_MIX_NSG) {
++        // y = x*w_norm for this threadgroup's segments, and the sum of squares of x per segment
++        threadgroup float * qs = shmem + 2*seg;   // [2][HC_MIX_NSG]
++        float q[2] = { 0.0f, 0.0f };
++        for (int e = tid*4; !(args.phases & 16) && e < (kh - kl + 1)*seg; e += 32*HC_MIX_NSG*4) {
+             const int kse = kl + e/seg;
+             const int ce  = kse/2;
+             const int ie  = (kse%2)*seg + e%seg;
+-            shmem[e] = *(device const float *) (x + ce*args.nb_x1 + ie*sizeof(float)) *
+-                       *(device const float *) (wn + ce*args.nb_wn1 + ie*sizeof(float));
++            const float4 xv = *(device const float4 *) (x  + ce*args.nb_x1  + ie*sizeof(float));
++            const float4 wv = *(device const float4 *) (wn + ce*args.nb_wn1 + ie*sizeof(float));
++            *(threadgroup float4 *) (shmem + e) = xv*wv;
++            if (e < seg) { q[0] += dot(xv, xv); } else { q[1] += dot(xv, xv); }
++        }
++        q[0] = simd_sum(q[0]);
++        q[1] = simd_sum(q[1]);
++        if (tiisg == 0) {
++            qs[sgitg] = q[0];
++            qs[HC_MIX_NSG + sgitg] = q[1];
+         }
+         threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (tid < 2 && kl + (int) tid <= kh) {
++            const int kse = kl + tid;
++            // the threadgroup holding row block 0 of a segment publishes its sum
++            if (kse*n_rb >= it0 && kse*n_rb <= it1) {
++                float t = 0.0f;
++                for (int k = 0; k < HC_MIX_NSG; ++k) {
++                    t += qs[tid*HC_MIX_NSG + k];
++                }
++                sqp[kse] = t;
++            }
++        }
+ 
+         if (has) {
+             threadgroup const float * ys = shmem + (ks - kl)*seg;
+             float acc[RB] = { 0.0f };
++            if (args.phases & 32) {
++                FOR_UNROLL (int k = 0; k < L1; ++k) {
++                    FOR_UNROLL (int r = 0; r < RB; ++r) {
++                        acc[r] += as_type<float>(u[r][k].x ^ u[r][k].y ^ u[r][k].z ^ u[r][k].w);
++                    }
++                }
++            } else
+             FOR_UNROLL (int k = 0; k < L1; ++k) {
+                 const int j = tiisg + 32*k;
+                 const float4 y0 = *(threadgroup const float4 *) (ys + 8*j);
+@@ -820,18 +848,6 @@ kernel void kernel_hc_mix_bf16(
+                 }
+             }
+ 
+-            if (rb == 0) {
+-                device const float * xs = (device const float *) (x + c*args.nb_x1) + i0;
+-                float q = 0.0f;
+-                for (int i = tiisg*4; i < seg; i += 32*4) {
+-                    const float4 v = *(device const float4 *) (xs + i);
+-                    q += dot(v, v);
+-                }
+-                q = simd_sum(q);
+-                if (tiisg == 0) {
+-                    sqp[ks] = q;
+-                }
+-            }
+         }
+     }
+ 
+@@ -851,6 +867,14 @@ kernel void kernel_hc_mix_bf16(
+         }
+     }
+ 
++    float xe[NO];
++    float we[NO];
++    FOR_UNROLL (int o = 0; o < NO; ++o) {
++        const int io = min(g + o*n_sg, n_embd - 1);
++        xe[o] = *(device const float *) (x  + cs*args.nb_x1  + io*sizeof(float));
++        we[o] = *(device const float *) (wn + cs*args.nb_wn1 + io*sizeof(float));
++    }
++
+     hc_grid_sync(arrive, (uint) args.n_tg, tid, err);
+ 
+     // ---- per threadgroup: rms scales, silu(down) into threadgroup memory, inject from tg 0
+@@ -860,10 +884,9 @@ kernel void kernel_hc_mix_bf16(
+         r[c] = 1.0f/sqrt(mean + args.eps);
+     }
+     for (int k = tid; k < n_rows; k += 32*HC_MIX_NSG) {
+-        float vv = 0.0f;
+-        FOR_UNROLL (int c = 0; c < hc; ++c) {
+-            vv += (part[k*KS + 2*c] + part[k*KS + 2*c + 1])*r[c];
+-        }
++        const float4 pa = *(device coherent(device) const float4 *) (part + k*KS);
++        const float4 pb = *(device coherent(device) const float4 *) (part + k*KS + 4);
++        const float vv = (pa.x + pa.y)*r[0] + (pa.z + pa.w)*r[1] + (pb.x + pb.y)*r[2] + (pb.z + pb.w)*r[3];
+         if (k < n_lo) {
+             const float t = args.s_in*vv + args.b_in;
+             shmem[k] = t / (1 + exp(-t));
+@@ -900,9 +923,7 @@ kernel void kernel_hc_mix_bf16(
+                 continue;
+             }
+ 
+-            const float xv = *(device const float *) (x  + cs*args.nb_x1  + io*sizeof(float));
+-            const float wv = *(device const float *) (wn + cs*args.nb_wn1 + io*sizeof(float));
+-            const float xn = (xv*r[cs])*wv;
++            const float xn = (xe[o]*r[cs])*we[o];
+             const float gt = 1.0f/(1.0f + exp(-so));
+ 
+             float result = 0.0f;
+-- 
+2.50.1 (Apple Git-155)
+

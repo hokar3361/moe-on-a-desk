@@ -1,0 +1,70 @@
+From 16266a6aee39bbfb0cfa3ee3e6fe5a515b392d64 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:03:54 +0900
+Subject: [PATCH 03/49] metal: profiling switches GGML_METAL_PROF_SKIP /
+ GGML_METAL_PROF_NOBARRIER
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp | 27 +++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index fe48c1c..3ac158d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -11,6 +11,7 @@
+ #include "ggml-metal-tuning.h"
+ 
+ #include <cassert>
++#include <string>
+ #include <algorithm>
+ #include <limits>
+ #include <cmath>
+@@ -156,12 +157,32 @@ int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
+     return ctx->n_nodes();
+ }
+ 
++static bool ggml_metal_prof_nobarrier() {
++    static const bool v = getenv("GGML_METAL_PROF_NOBARRIER") != nullptr;
++    return v;
++}
++
++// GGML_METAL_PROF_SKIP: comma separated op descriptions, optionally with ".<src0 type>"
++static bool ggml_metal_prof_skip(const ggml_tensor * node) {
++    static const char * env = getenv("GGML_METAL_PROF_SKIP");
++    if (!env) {
++        return false;
++    }
++    char key0[64], key1[96];
++    snprintf(key0, sizeof(key0), ",%s,", ggml_op_desc(node));
++    snprintf(key1, sizeof(key1), ",%s.%s,", ggml_op_desc(node), node->src[0] ? ggml_type_name(node->src[0]->type) : "none");
++    static std::string list = std::string(",") + env + ",";
++    return list.find(key0) != std::string::npos || list.find(key1) != std::string::npos;
++}
++
+ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+     if (!ctx->mem_ranges) {
+         return true;
+     }
+ 
+-    ggml_metal_encoder_memory_barrier(ctx->enc);
++    if (!ggml_metal_prof_nobarrier()) {
++        ggml_metal_encoder_memory_barrier(ctx->enc);
++    }
+ 
+     ggml_mem_ranges_reset(ctx->mem_ranges);
+ 
+@@ -219,6 +240,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         return 1;
+     }
+ 
++    if (ggml_metal_prof_skip(node)) {
++        return 1;
++    }
++
+     int n_fuse = 1;
+ 
+     // check if the current node can run concurrently with other nodes before it
+-- 
+2.50.1 (Apple Git-155)
+

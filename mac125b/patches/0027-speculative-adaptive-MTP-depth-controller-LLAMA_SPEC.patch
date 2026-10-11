@@ -1,0 +1,130 @@
+From 3b88b2e04673437733afd4068fb4ebfd8cb97aff Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 00:27:34 +0900
+Subject: [PATCH 27/49] speculative: adaptive MTP depth controller
+ (LLAMA_SPEC_DEPTH_CTL=1)
+
+---
+ common/speculative.cpp | 85 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 85 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 7e0b1ae..b824d70 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1474,6 +1474,50 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     };
+     ev_planner ev;
+ 
++    // ---- adaptive depth controller (LLAMA_SPEC_DEPTH_CTL=1) ----
++    struct depth_ctl {
++        bool enabled = false;
++        int  cap = 3;
++        int  depth = 3;                 // depth in use
++        int  last_depth = 0;            // depth drafted in the previous round
++        int  rounds_at = 0;
++        bool exploring = false;
++        float a[17];                    // conditional acceptance of position k given k-1 accepted
++        float t[17];                    // round wall ms at depth d (0 = unknown)
++        int64_t t_prev_us = 0;
++        uint64_t rounds = 0;
++
++        void init(int n_max) {
++            const char * e = getenv("LLAMA_SPEC_DEPTH_CTL");
++            enabled = e && atoi(e) != 0;
++            cap = std::min(16, std::max(1, n_max));
++            depth = std::min(cap, 3);
++            for (int k = 0; k <= 16; ++k) { a[k] = 0.7f; t[k] = 0.0f; }
++        }
++        // prior round time when unmeasured: measured verify table + 1.5 ms per draft step
++        float T(int d) const {
++            if (t[d] > 0.0f) return t[d];
++            static const float v[] = { 0.0f, 21.0f, 28.8f, 31.6f, 34.3f, 37.2f, 40.1f, 43.0f, 46.0f };
++            const int w = d + 1;
++            const float tv = w <= 8 ? v[w] : 46.0f + 3.0f*(w - 8);
++            return tv + 1.5f*d;
++        }
++        float E(int d) const {
++            float e = 1.0f, P = 1.0f;
++            for (int k = 1; k <= d; ++k) { P *= a[k]; e += P; }
++            return e;
++        }
++        int best() const {
++            int bd = 1; float br = 0.0f;
++            for (int d = 1; d <= cap; ++d) {
++                const float r = E(d)/T(d);
++                if (r > br) { br = r; bd = d; }
++            }
++            return bd;
++        }
++    };
++    depth_ctl dctl;
++
+     // ---- MTP-agreement-gated context lookup (LLAMA_SPEC_LOOKUP=1) ----
+     bool    lk_enabled = false;
+     int32_t mtp_depth  = 0;   // 0 = params.n_max
+@@ -1561,6 +1605,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+         ev.init();
++        dctl.init(params.draft.n_max);
++        if (dctl.enabled) {
++            LOG_INF("%s: adaptive MTP depth on (cap %d)\n", __func__, dctl.cap);
++        }
+         if (const char * e = getenv("LLAMA_SPEC_LOOKUP")) { lk_mode = atoi(e); lk_enabled = lk_mode == 1; }
+         lk_last.assign(n_seq, 0);
+         if (lk_mode == 2) {
+@@ -1790,6 +1838,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
++        if (dctl.enabled) {
++            const int64_t now = ggml_time_us();
++            if (dctl.t_prev_us > 0 && dctl.last_depth > 0) {
++                const float ms = (now - dctl.t_prev_us)/1000.0f;
++                float & td = dctl.t[dctl.last_depth];
++                if (ms < 1000.0f) {   // ignore gaps between requests
++                    td = td > 0.0f ? 0.8f*td + 0.2f*ms : ms;
++                }
++            }
++            dctl.t_prev_us = now;
++
++            int d = dctl.best();
++            if (d != dctl.depth && dctl.E(d)/dctl.T(d) < 1.03f*dctl.E(dctl.depth)/dctl.T(dctl.depth)) {
++                d = dctl.depth;   // hysteresis
++            }
++            if (d != dctl.depth) { dctl.depth = d; dctl.rounds_at = 0; }
++            dctl.exploring = false;
++            if (++dctl.rounds_at % 16 == 0 && dctl.depth < dctl.cap) {
++                dctl.exploring = true;
++            }
++            mtp_depth = dctl.exploring ? dctl.depth + 1 : dctl.depth;
++            dctl.last_depth = mtp_depth;
++        }
++
+         batch.clear();
+ 
+         // keep track of which sequences are still drafting
+@@ -2045,6 +2117,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        if (dctl.enabled && dctl.last_depth > 0) {
++            // positions 1..min(depth, n_accepted+1) were tried; the first n_accepted succeeded
++            const int tried = std::min<int>(dctl.last_depth, n_accepted + 1);
++            for (int k = 1; k <= tried; ++k) {
++                const float hit = k <= (int) n_accepted ? 1.0f : 0.0f;
++                dctl.a[k] = 0.9f*dctl.a[k] + 0.1f*hit;
++            }
++            if (++dctl.rounds % 100 == 0) {
++                LOG_INF("%s: depth ctl rounds %llu depth %d a1..4 %.2f %.2f %.2f %.2f T(d) %.1f ms\n", __func__,
++                        (unsigned long long) dctl.rounds, dctl.depth, dctl.a[1], dctl.a[2], dctl.a[3], dctl.a[4], dctl.T(dctl.depth));
++            }
++        }
++
+         if (lk_mode == 2 && lk_last[seq_id] > 0) {
+             const int32_t L = lk_last[seq_id];
+             lk2_rounds++;
+-- 
+2.50.1 (Apple Git-155)
+

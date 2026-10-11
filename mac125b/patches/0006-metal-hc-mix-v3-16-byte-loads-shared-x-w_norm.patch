@@ -1,0 +1,233 @@
+From f339d7180de960d05e46e4646b970d036e598bbf Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:16:27 +0900
+Subject: [PATCH 06/49] metal: hc mix v3 (16-byte loads, shared x*w_norm)
+
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp |   2 +-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |   6 +-
+ ggml/src/ggml-metal/kernels/misc.metal    | 136 ++++++++++++++--------
+ 3 files changed, 92 insertions(+), 52 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index b2374ff..2ef8a75 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -871,7 +871,7 @@ static bool ggml_metal_fusion_check_hc_mix(
+     if (x->type != GGML_TYPE_F32 || hc != 4 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(x)) {
+         return false;
+     }
+-    if (n_embd % 512 != 0) {
++    if (n_embd % 512 != 0 || n_embd > 8192) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 0ec745e..5f5f9ea 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4484,7 +4484,9 @@ static int ggml_metal_op_hc_mix(ggml_metal_op_t ctx, int idx, int n_fuse) {
+     const ggml_tensor * x  = norm->src[0];
+     const ggml_tensor * wn = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+ 
+-    static const int n_tg = getenv("GGML_METAL_HC_MIX_TG") ? atoi(getenv("GGML_METAL_HC_MIX_TG")) : 80;
++    static const int n_tg_env = getenv("GGML_METAL_HC_MIX_TG") ? atoi(getenv("GGML_METAL_HC_MIX_TG")) : 0;
++    const int n_items = (int) ((down->src[0]->ne[1] + 4)/4)*8;
++    const int n_tg = std::max(n_tg_env, (n_items + 7)/8);
+     static uint32_t slot = 0;
+ 
+     float eps;
+@@ -4534,7 +4536,7 @@ static int ggml_metal_op_hc_mix(ggml_metal_op_t ctx, int idx, int n_fuse) {
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(pre),          7);
+     ggml_metal_encoder_set_buffer(enc, ggml_metal_device_get_sync_buffer(ctx->dev), 8);
+ 
+-    ggml_metal_encoder_set_threadgroup_memory_size(enc, GGML_PAD(args.n_lo*sizeof(float), 16), 0);
++    ggml_metal_encoder_set_threadgroup_memory_size(enc, std::max<size_t>(args.n_lo, x->ne[0])*sizeof(float), 0);
+     ggml_metal_encoder_dispatch_threadgroups(enc, n_tg, 1, 1, 32*8, 1, 1);
+ 
+     return n_fuse;
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index ec0e1fc..d4d3546 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -703,6 +703,14 @@ static inline void hc_grid_sync(device atomic_uint * arrive, uint target, ushort
+ //   xn  = rms_norm(x)*w_norm                       (per stream)
+ //   inj = W_inject xn,  lo = silu(s_in*(W_down xn) + b_in)
+ //   mixed[i] = pre_scale * sum_c xn[i,c]*sigmoid((W_up lo)[c*n_embd + i])
++// 8 bf16 (one 16-byte load) -> two float4
++static inline void hc_bf16x8(uint4 u, thread float4 & lo, thread float4 & hi) {
++    lo = float4(as_type<float>(u.x << 16), as_type<float>(u.x & 0xffff0000u),
++                as_type<float>(u.y << 16), as_type<float>(u.y & 0xffff0000u));
++    hi = float4(as_type<float>(u.z << 16), as_type<float>(u.z & 0xffff0000u),
++                as_type<float>(u.w << 16), as_type<float>(u.w & 0xffff0000u));
++}
++
+ kernel void kernel_hc_mix_bf16(
+         constant ggml_metal_kargs_hc_mix & args,
+         device const char * x,
+@@ -732,52 +740,81 @@ kernel void kernel_hc_mix_bf16(
+     const int n_embd = args.n_embd;
+     const int n_lo   = args.n_lo;
+     const int n_rows = n_lo + hc;
++    const int n_rb   = n_rows/RB;
+     const int g      = tgpig*HC_MIX_NSG + sgitg;
+     const int n_sg   = args.n_tg*HC_MIX_NSG;
+     const int seg    = n_embd/2;  // elements per K segment
+-
+-    // ---- phase 1: partial dots of RB rows over one K segment; sum of squares per segment
+-    const int n_items = (n_rows/RB)*KS;
+-    for (int item = g; (args.phases & 1) && item < n_items; item += n_sg) {
+-        const int rb = item / KS;
+-        const int ks = item % KS;
+-        const int c  = ks / 2;
+-        const int i0 = (ks % 2)*seg;
+-
+-        device const float * xs = (device const float *) (x  + c*args.nb_x1)  + i0;
+-        device const float * ws = (device const float *) (wn + c*args.nb_wn1) + i0;
+-
+-        device const bfloat * wr[RB];
+-        FOR_UNROLL (int r = 0; r < RB; ++r) {
+-            const int row = rb*RB + r;
+-            wr[r] = (row < n_lo
+-                ? (device const bfloat *) (wd + row*args.nb_down1)
+-                : (device const bfloat *) (wi + (row - n_lo)*args.nb_inj1)) + c*n_embd + i0;
++    const int n_items = n_rb*KS;
++
++    // ---- phase 1: item = (segment ks, row block rb); a threadgroup spans at most two segments
++    const int it0 = min((int) tgpig*HC_MIX_NSG, n_items - 1);
++    const int it1 = min((int) tgpig*HC_MIX_NSG + HC_MIX_NSG - 1, n_items - 1);
++    const int kl  = it0 / n_rb;
++    const int kh  = it1 / n_rb;
++
++    if (args.phases & 1) {
++        // y = x*w_norm for segments kl..kh
++        for (int e = tid; e < (kh - kl + 1)*seg; e += 32*HC_MIX_NSG) {
++            const int ks = kl + e/seg;
++            const int c  = ks/2;
++            const int i  = (ks%2)*seg + e%seg;
++            shmem[e] = *(device const float *) (x + c*args.nb_x1 + i*sizeof(float)) *
++                       *(device const float *) (wn + c*args.nb_wn1 + i*sizeof(float));
+         }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-        float acc[RB] = { 0.0f };
+-        float q = 0.0f;
+-        for (int i = tiisg*8; i < seg; i += 32*8) {
+-            const float4 x0 = *(device const float4 *) (xs + i);
+-            const float4 x1 = *(device const float4 *) (xs + i + 4);
+-            const float4 y0 = x0 * *(device const float4 *) (ws + i);
+-            const float4 y1 = x1 * *(device const float4 *) (ws + i + 4);
+-            q += dot(x0, x0) + dot(x1, x1);
++        const int item = g;
++        if (item < n_items) {
++            const int ks = item / n_rb;
++            const int rb = item % n_rb;
++            const int c  = ks / 2;
++            const int i0 = (ks % 2)*seg;
++
++            threadgroup const float * ys = shmem + (ks - kl)*seg;
++
++            device const uint4 * wr[RB];
+             FOR_UNROLL (int r = 0; r < RB; ++r) {
+-                acc[r] += dot(float4(*(device const bfloat4 *) (wr[r] + i)),     y0)
+-                        + dot(float4(*(device const bfloat4 *) (wr[r] + i + 4)), y1);
++                const int row = rb*RB + r;
++                wr[r] = (device const uint4 *) ((row < n_lo
++                    ? (device const bfloat *) (wd + row*args.nb_down1)
++                    : (device const bfloat *) (wi + (row - n_lo)*args.nb_inj1)) + c*n_embd + i0);
++            }
++
++            float acc[RB] = { 0.0f };
++            for (int j = tiisg; j < seg/8; j += 32) {
++                uint4 u[RB];
++                FOR_UNROLL (int r = 0; r < RB; ++r) {
++                    u[r] = wr[r][j];
++                }
++                const float4 y0 = *(threadgroup const float4 *) (ys + 8*j);
++                const float4 y1 = *(threadgroup const float4 *) (ys + 8*j + 4);
++                FOR_UNROLL (int r = 0; r < RB; ++r) {
++                    float4 lo, hi;
++                    hc_bf16x8(u[r], lo, hi);
++                    acc[r] += dot(lo, y0) + dot(hi, y1);
++                }
+             }
+-        }
+-        FOR_UNROLL (int r = 0; r < RB; ++r) {
+-            acc[r] = simd_sum(acc[r]);
+-        }
+-        q = simd_sum(q);
+-        if (tiisg == 0) {
+             FOR_UNROLL (int r = 0; r < RB; ++r) {
+-                part[(rb*RB + r)*KS + ks] = acc[r];
++                acc[r] = simd_sum(acc[r]);
+             }
++            if (tiisg == 0) {
++                FOR_UNROLL (int r = 0; r < RB; ++r) {
++                    part[(rb*RB + r)*KS + ks] = acc[r];
++                }
++            }
++
++            // sum of squares of x over this segment, once per segment
+             if (rb == 0) {
+-                sqp[ks] = q;
++                device const float * xs = (device const float *) (x + c*args.nb_x1) + i0;
++                float q = 0.0f;
++                for (int i = tiisg*4; i < seg; i += 32*4) {
++                    const float4 v = *(device const float4 *) (xs + i);
++                    q += dot(v, v);
++                }
++                q = simd_sum(q);
++                if (tiisg == 0) {
++                    sqp[ks] = q;
++                }
+             }
+         }
+     }
+@@ -804,30 +841,31 @@ kernel void kernel_hc_mix_bf16(
+     }
+     threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
+-    // ---- phase 2: rows i + c*n_embd of W_up for NO outputs at a time, 8 lanes per row
+-    const int c    = tiisg/8;
++    // ---- phase 2: rows io + c*n_embd of W_up for NO outputs at a time, 8 lanes per row
++    const int c     = tiisg/8;
+     const int part8 = tiisg%8;
+-    const int per  = n_lo/8;   // elements per lane per row (multiple of 8)
++    const int per   = n_lo/8;   // elements per lane per row (multiple of 8)
+ 
+     threadgroup const float * a = shmem + part8*per;
+     for (int i = g; (args.phases & 2) && i < n_embd; i += NO*n_sg) {
+         float s[NO];
++        device const uint4 * wrow[NO];
+         FOR_UNROLL (int o = 0; o < NO; ++o) {
+             s[o] = 0.0f;
++            const int io = min(i + o*n_sg, n_embd - 1);
++            wrow[o] = (device const uint4 *) ((device const bfloat *) (wu + (c*n_embd + io)*args.nb_up1) + part8*per);
+         }
+-        for (int e = 0; e < per; e += 8) {
+-            bfloat4 w0[NO];
+-            bfloat4 w1[NO];
++        for (int e = 0; e < per/8; ++e) {
++            uint4 u[NO];
+             FOR_UNROLL (int o = 0; o < NO; ++o) {
+-                const int io = min(i + o*n_sg, n_embd - 1);
+-                device const bfloat * wrow = (device const bfloat *) (wu + (c*n_embd + io)*args.nb_up1) + part8*per + e;
+-                w0[o] = *(device const bfloat4 *) (wrow);
+-                w1[o] = *(device const bfloat4 *) (wrow + 4);
++                u[o] = wrow[o][e];
+             }
+-            const float4 a0 = *(threadgroup const float4 *) (a + e);
+-            const float4 a1 = *(threadgroup const float4 *) (a + e + 4);
++            const float4 a0 = *(threadgroup const float4 *) (a + 8*e);
++            const float4 a1 = *(threadgroup const float4 *) (a + 8*e + 4);
+             FOR_UNROLL (int o = 0; o < NO; ++o) {
+-                s[o] += dot(float4(w0[o]), a0) + dot(float4(w1[o]), a1);
++                float4 lo, hi;
++                hc_bf16x8(u[o], lo, hi);
++                s[o] += dot(lo, a0) + dot(hi, a1);
+             }
+         }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,112 @@
+From 28bb39acb7bcd2e2dcf5c062d230ea2122575ebb Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 00:13:19 +0900
+Subject: [PATCH 24/49] speculative: MTP-agreement-gated context lookup
+ (LLAMA_SPEC_LOOKUP=1, opt-in) + LLAMA_SPEC_MTP_DEPTH
+
+---
+ common/speculative.cpp | 67 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index eae6555..f04d134 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1473,6 +1473,48 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         float rate(float E, int k, int s) const { return E/(T(k + 1) + draft_ms*s); }
+     };
+     ev_planner ev;
++
++    // ---- MTP-agreement-gated context lookup (LLAMA_SPEC_LOOKUP=1) ----
++    bool    lk_enabled = false;
++    int32_t mtp_depth  = 0;   // 0 = params.n_max
++    int32_t lk_max     = 8;
++    uint64_t lk_rounds = 0, lk_hits = 0;
++
++    // history = tokens + id_last + d1 (virtual); returns d1 + continuation of the latest earlier match
++    static bool lookup_find(const llama_tokens & tok, llama_token id_last, llama_token d1, int32_t n_max, llama_tokens & out) {
++        const int64_t n = (int64_t) tok.size();
++        for (int ng = 4; ng >= 3; --ng) {
++            // pattern = tok[n-ng+2 .. n-1], id_last, d1
++            if (n < ng + 1) {
++                continue;
++            }
++            llama_token pat[4];
++            int np = 0;
++            for (int64_t j = n - (ng - 2); j < n; ++j) pat[np++] = tok[j];
++            pat[np++] = id_last;
++            pat[np++] = d1;
++            // search backwards, the pattern must end before the current position
++            for (int64_t j = n - ng; j >= 0; --j) {
++                bool ok = true;
++                for (int k = 0; k < ng; ++k) {
++                    // positions j..j+ng-1 within tok (the virtual tail is not part of tok)
++                    if (j + k >= n || tok[j + k] != pat[k]) { ok = false; break; }
++                }
++                if (!ok) continue;
++                const int64_t c0 = j + ng;    // first token after the matched n-gram
++                if (c0 >= n) continue;
++                out.clear();
++                out.push_back(d1);
++                for (int64_t c = c0; c < n && (int32_t) out.size() < n_max; ++c) {
++                    out.push_back(tok[c]);
++                }
++                if (out.size() >= 3) {
++                    return true;
++                }
++            }
++        }
++        return false;
++    }
+     std::vector<std::vector<float>> ev_last_p;   // calibrated-input probabilities of the last draft, per seq
+     std::vector<float> ev_P, ev_E;                // running chain acceptance and expected accepted, per seq
+ 
+@@ -1491,6 +1533,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+         ev.init();
++        if (const char * e = getenv("LLAMA_SPEC_LOOKUP")) lk_enabled = atoi(e) != 0;
++        if (const char * e = getenv("LLAMA_SPEC_LOOKUP_MAX")) lk_max = std::max(2, atoi(e));
++        if (const char * e = getenv("LLAMA_SPEC_MTP_DEPTH")) mtp_depth = std::max(1, atoi(e));
++        if (lk_enabled) {
++            LOG_INF("%s: MTP-gated context lookup on (max %d)\n", __func__, lk_max);
++        }
+         ev_last_p.assign(n_seq, {});
+         ev_P.assign(n_seq, 1.0f);
+         ev_E.assign(n_seq, 1.0f);
+@@ -1813,6 +1861,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
++                // MTP-agreed context lookup: the first MTP token selects a continuation from the history
++                if (lk_enabled && i == 0 && !dparams.at(seq_id).result_q) {
++                    lk_rounds++;
++                    llama_tokens cont;
++                    if (lookup_find(*dparams.at(seq_id).prompt, dparams.at(seq_id).id_last, id, std::min(lk_max, (int32_t) params.n_max), cont)) {
++                        lk_hits++;
++                        auto & res = *dparams.at(seq_id).result;
++                        res.assign(cont.begin(), cont.end());
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        if (lk_rounds % 200 == 0) {
++                            LOG_INF("%s: lookup hits %llu / %llu rounds\n", __func__, (unsigned long long) lk_hits, (unsigned long long) lk_rounds);
++                        }
++                        continue;
++                    }
++                }
++
+                 // EV planner: include this token only if it improves expected tokens per round time
+                 if (ev.enabled) {
+                     const int   k     = (int) dparams.at(seq_id).result->size();   // tokens included so far
+@@ -1852,7 +1917,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                 }
+ 
+-                if (params.n_max <= (int) result.size()) {
++                if ((mtp_depth > 0 ? std::min(params.n_max, mtp_depth) : params.n_max) <= (int) result.size()) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+                     continue;
+-- 
+2.50.1 (Apple Git-155)
+

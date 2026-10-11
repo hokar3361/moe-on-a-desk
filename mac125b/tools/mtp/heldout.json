@@ -1,0 +1,20 @@
+[
+ "Write a Haskell function that implements a skip list. Include comments and a short usage example.",
+ "Write a Haskell function that computes Fibonacci numbers with memoization and explains complexity. Include comments and a short usage example.",
+ "Write a Haskell function that implements union-find with path compression. Include comments and a short usage example.",
+ "Write a Lua function that implements a skip list. Include comments and a short usage example.",
+ "Write a Lua function that computes Fibonacci numbers with memoization and explains complexity. Include comments and a short usage example.",
+ "Write a Lua function that implements union-find with path compression. Include comments and a short usage example.",
+ "Write a poem about a beekeeper in a city of glass towers.",
+ "Write a poem about the history of the violin.",
+ "Write a poem about how tides of traffic form in cities.",
+ "Write a poem about a gardener who grows impossible flowers.",
+ "Write a review of an imaginary book about a beekeeper in a city of glass towers.",
+ "Write a review of an imaginary book about the history of the violin.",
+ "Write a review of an imaginary book about how tides of traffic form in cities.",
+ "Write a review of an imaginary book about a gardener who grows impossible flowers.",
+ "Write a Python function that implements a skip list. Include comments and a short usage example.",
+ "Write a Python function that computes Fibonacci numbers with memoization and explains complexity. Include comments and a short usage example.",
+ "Write a Python function that implements union-find with path compression. Include comments and a short usage example.",
+ "Write a Python function that validates balanced brackets in a string. Include comments and a short usage example."
+]

@@ -1,0 +1,86 @@
+From d32b907b8300219d8df2a21a894ac7da15b004a0 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 17:43:26 +0900
+Subject: [PATCH 45/49] qwen4exp: QSA with every pool selected (n_pool <=
+ top_k/kpool) uses the causal mask directly: skip the indexer query, scoring,
+ top-k and mask build, keep the indexer cache updates (bit-identical);
+ barriers 1282 -> 1025, verify -1.05 ms at B=1..6; LLAMA_QSA_DENSE_SHORT=0
+ disables
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 12 ++++++++++++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   |  2 +-
+ src/models/qwen4exp.cpp                  |  9 +++++++++
+ 3 files changed, 22 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index fc0d61a..819e291 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -580,10 +580,18 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+             ctx->n_nodes_1      = 0;
+             ctx->n_nodes_per_cb = 0;
+         } else {
++            const int geo   = getenv("GGML_METAL_SPLIT_GEO") ? atoi(getenv("GGML_METAL_SPLIT_GEO")) : 0;
++            const int geo_k = getenv("GGML_METAL_SPLIT_K")   ? atoi(getenv("GGML_METAL_SPLIT_K"))   : 8;
++            if (geo > 0 && ctx->n_cb == 2 && gf->n_nodes > geo*(geo_k + 2)) {
++                ctx->n_nodes_0      = geo;
++                ctx->n_nodes_1      = gf->n_nodes - ctx->n_nodes_0;
++                ctx->n_nodes_per_cb = geo*geo_k;   // helper 0: [geo, geo + geo*k), helper 1: the rest
++            } else {
+             ctx->n_nodes_0      = MIN(n_main, gf->n_nodes);
+             ctx->n_nodes_1      = gf->n_nodes - ctx->n_nodes_0;
+ 
+             ctx->n_nodes_per_cb = (ctx->n_nodes_1 + ctx->n_cb - 1) / ctx->n_cb;
++            }
+         }
+ 
+         if (ctx->capture_compute >= 0) {
+@@ -790,6 +798,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
+         n_cb = 0;
+     }
+ 
++    if (getenv("GGML_METAL_N_CB")) {
++        n_cb = atoi(getenv("GGML_METAL_N_CB"));
++    }
++
+     if (ctx->n_cb != n_cb) {
+         ctx->n_cb = MIN(n_cb, GGML_METAL_MAX_COMMAND_BUFFERS);
+ 
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 447909d..4135fef 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -422,7 +422,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
+         }
+         {
+             static const bool stagelog = getenv("GGML_METAL_PROF_STAGELOG") != nullptr;
+-            if (stagelog && ctx->n_nodes_graph() > 5000) {
++            if (stagelog && ctx->n_nodes_graph() > atoi(getenv("GGML_METAL_PROF_STAGELOG"))) {
+                 fprintf(stderr, "stagelog %c %s %s %s %lld %lld %lld\n", (!is_concurrent && !nobar) ? 'B' : '.', ggml_op_desc(node), ggml_get_name(node),
+                         node->src[0] ? ggml_type_name(node->src[0]->type) : "-", (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2]);
+             }
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index d5f5d6a..3d84be0 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -822,6 +822,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
+     // the older pools come from the rows earlier ubatches wrote
+     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
++
++    // every pool selected: the selection mask is the causal mask (selected cells add 0, the rest are masked anyway)
++    {
++        static const bool dense_short = getenv("LLAMA_QSA_DENSE_SHORT") == nullptr || atoi(getenv("LLAMA_QSA_DENSE_SHORT")) != 0;
++        if (dense_short && n_pool <= (int64_t) (hparams.indexer_top_k / kpool)) {
++            return kq_mask;
++        }
++    }
++
+     ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
+     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+     cb(pooled, "indexer_k", il);
+-- 
+2.50.1 (Apple Git-155)
+

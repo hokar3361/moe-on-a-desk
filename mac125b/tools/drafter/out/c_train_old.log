@@ -1,0 +1,9 @@
+train texts 328, answer tokens 267593, mode old, lr 5e-06
+trainable params 88.9M
+ep 0 step 50 loss 0.7251 accs [0.927 0.872 0.789 0.734] (74 s)
+ep 0 step 100 loss 1.6119 accs [0.836 0.682 0.583 0.576] (146 s)
+ep 0 step 150 loss 1.9374 accs [0.724 0.625 0.531 0.505] (218 s)
+ep 0 step 200 loss 0.9483 accs [0.867 0.826 0.706 0.667] (291 s)
+ep 0 step 250 loss 0.7784 accs [0.888 0.797 0.794 0.732] (364 s)
+ep 0 step 300 loss 1.4136 accs [0.831 0.698 0.628 0.591] (436 s)
+saved D:/GPUNW/gpunw-repo/mac125b/tools/drafter/out/c_old.pt (477 s)

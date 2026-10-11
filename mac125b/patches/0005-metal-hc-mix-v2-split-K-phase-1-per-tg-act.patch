@@ -1,0 +1,247 @@
+From f062361e2f1547521bb919ac545b7516df0ffc2e Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:11:34 +0900
+Subject: [PATCH 05/49] metal: hc mix v2 (split-K phase 1, per-tg act)
+
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp |   2 +-
+ ggml/src/ggml-metal/kernels/misc.metal    | 182 +++++++++++++---------
+ 2 files changed, 107 insertions(+), 77 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index 1830df2..b2374ff 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -871,7 +871,7 @@ static bool ggml_metal_fusion_check_hc_mix(
+     if (x->type != GGML_TYPE_F32 || hc != 4 || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous(x)) {
+         return false;
+     }
+-    if (n_embd % 256 != 0) {
++    if (n_embd % 512 != 0) {
+         return false;
+     }
+ 
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index 98195ba..ec0e1fc 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -719,110 +719,140 @@ kernel void kernel_hc_mix_bf16(
+         ushort tiisg [[thread_index_in_simdgroup]],
+         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+     constexpr int hc = 4;
++    constexpr int RB = 4;       // rows per simdgroup in phase 1
++    constexpr int KS = 2*hc;    // K segments in phase 1 (two per stream)
++    constexpr int NO = 4;       // outputs per simdgroup step in phase 2
+ 
+     device atomic_uint * arrive = (device atomic_uint *) sync + 2*args.slot;
+     device atomic_uint * exitc  = (device atomic_uint *) sync + 2*args.slot + 1;
+     device atomic_uint * err    = (device atomic_uint *) sync + 2*256;
+-    device coherent(device) float * act = (device coherent(device) float *) (sync + 4096);
+-    device coherent(device) float * rr  = act + 1024;
++    device coherent(device) float * part = (device coherent(device) float *) (sync + 4096); // [n_rows][KS]
++    device coherent(device) float * sqp  = part + 1032*KS;                                  // [KS]
+ 
+     const int n_embd = args.n_embd;
+     const int n_lo   = args.n_lo;
++    const int n_rows = n_lo + hc;
+     const int g      = tgpig*HC_MIX_NSG + sgitg;
+     const int n_sg   = args.n_tg*HC_MIX_NSG;
++    const int seg    = n_embd/2;  // elements per K segment
++
++    // ---- phase 1: partial dots of RB rows over one K segment; sum of squares per segment
++    const int n_items = (n_rows/RB)*KS;
++    for (int item = g; (args.phases & 1) && item < n_items; item += n_sg) {
++        const int rb = item / KS;
++        const int ks = item % KS;
++        const int c  = ks / 2;
++        const int i0 = (ks % 2)*seg;
++
++        device const float * xs = (device const float *) (x  + c*args.nb_x1)  + i0;
++        device const float * ws = (device const float *) (wn + c*args.nb_wn1) + i0;
++
++        device const bfloat * wr[RB];
++        FOR_UNROLL (int r = 0; r < RB; ++r) {
++            const int row = rb*RB + r;
++            wr[r] = (row < n_lo
++                ? (device const bfloat *) (wd + row*args.nb_down1)
++                : (device const bfloat *) (wi + (row - n_lo)*args.nb_inj1)) + c*n_embd + i0;
++        }
+ 
+-    // ---- phase 1: one simdgroup per row of [W_down; W_inject]
+-    if ((args.phases & 1) && g < n_lo + hc) {
+-        device const bfloat * w = g < n_lo
+-            ? (device const bfloat *) (wd + g*args.nb_down1)
+-            : (device const bfloat *) (wi + (g - n_lo)*args.nb_inj1);
+-
+-        float acc[hc];
+-        float sq[hc];
+-        FOR_UNROLL (int c = 0; c < hc; ++c) {
+-            device const float  * xs = (device const float  *) (x  + c*args.nb_x1);
+-            device const float  * ws = (device const float  *) (wn + c*args.nb_wn1);
+-            device const bfloat * wr = w + c*n_embd;
+-            float a = 0.0f;
+-            float q = 0.0f;
+-            for (int i = tiisg*8; i < n_embd; i += 32*8) {
+-                const float4 x0 = *(device const float4 *) (xs + i);
+-                const float4 x1 = *(device const float4 *) (xs + i + 4);
+-                const float4 n0 = *(device const float4 *) (ws + i);
+-                const float4 n1 = *(device const float4 *) (ws + i + 4);
+-                const float4 b0 = float4(*(device const bfloat4 *) (wr + i));
+-                const float4 b1 = float4(*(device const bfloat4 *) (wr + i + 4));
+-                a += dot(b0, x0*n0) + dot(b1, x1*n1);
+-                q += dot(x0, x0) + dot(x1, x1);
++        float acc[RB] = { 0.0f };
++        float q = 0.0f;
++        for (int i = tiisg*8; i < seg; i += 32*8) {
++            const float4 x0 = *(device const float4 *) (xs + i);
++            const float4 x1 = *(device const float4 *) (xs + i + 4);
++            const float4 y0 = x0 * *(device const float4 *) (ws + i);
++            const float4 y1 = x1 * *(device const float4 *) (ws + i + 4);
++            q += dot(x0, x0) + dot(x1, x1);
++            FOR_UNROLL (int r = 0; r < RB; ++r) {
++                acc[r] += dot(float4(*(device const bfloat4 *) (wr[r] + i)),     y0)
++                        + dot(float4(*(device const bfloat4 *) (wr[r] + i + 4)), y1);
+             }
+-            acc[c] = simd_sum(a);
+-            sq[c]  = simd_sum(q);
+         }
+-
+-        float r[hc];
+-        float v = 0.0f;
+-        FOR_UNROLL (int c = 0; c < hc; ++c) {
+-            const float mean = sq[c]/n_embd;
+-            r[c] = 1.0f/sqrt(mean + args.eps);
+-            v += acc[c]*r[c];
++        FOR_UNROLL (int r = 0; r < RB; ++r) {
++            acc[r] = simd_sum(acc[r]);
+         }
+-
++        q = simd_sum(q);
+         if (tiisg == 0) {
+-            if (g < n_lo) {
+-                const float t = args.s_in*v + args.b_in;
+-                act[g] = t / (1 + exp(-t));
+-            } else {
+-                *(device float *) (inj + (g - n_lo)*args.nb_inj_d0) = v;
++            FOR_UNROLL (int r = 0; r < RB; ++r) {
++                part[(rb*RB + r)*KS + ks] = acc[r];
+             }
+-            if (g == 0) {
+-                FOR_UNROLL (int c = 0; c < hc; ++c) {
+-                    rr[c] = r[c];
+-                }
++            if (rb == 0) {
++                sqp[ks] = q;
+             }
+         }
+     }
+ 
+     hc_grid_sync(arrive, (uint) args.n_tg, tid, err);
+ 
+-    // ---- phase 2: rows i, i+n_embd, i+2n_embd, i+3n_embd of W_up per output, 8 lanes per row
+-    for (int k = tid; k < n_lo; k += 32*HC_MIX_NSG) {
+-        shmem[k] = act[k];
+-    }
+-    threadgroup_barrier(mem_flags::mem_threadgroup);
+-
++    // ---- per threadgroup: rms scales, silu(down) into threadgroup memory, inject from tg 0
+     float r[hc];
+     FOR_UNROLL (int c = 0; c < hc; ++c) {
+-        r[c] = rr[c];
++        const float mean = (sqp[2*c] + sqp[2*c + 1])/n_embd;
++        r[c] = 1.0f/sqrt(mean + args.eps);
+     }
++    for (int k = tid; k < n_rows; k += 32*HC_MIX_NSG) {
++        float v = 0.0f;
++        FOR_UNROLL (int c = 0; c < hc; ++c) {
++            v += (part[k*KS + 2*c] + part[k*KS + 2*c + 1])*r[c];
++        }
++        if (k < n_lo) {
++            const float t = args.s_in*v + args.b_in;
++            shmem[k] = t / (1 + exp(-t));
++        } else if (tgpig == 0) {
++            *(device float *) (inj + (k - n_lo)*args.nb_inj_d0) = v;
++        }
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
+ 
++    // ---- phase 2: rows i + c*n_embd of W_up for NO outputs at a time, 8 lanes per row
+     const int c    = tiisg/8;
+-    const int part = tiisg%8;
+-    const int per  = n_lo/8;
+-
+-    for (int i = g; (args.phases & 2) && i < n_embd; i += n_sg) {
+-        device const bfloat * wrow = (device const bfloat *) (wu + (c*n_embd + i)*args.nb_up1) + part*per;
+-        threadgroup const float * a = shmem + part*per;
+-        float s = 0.0f;
+-        for (int e = 0; e < per; e += 8) {
+-            const float4 b0 = float4(*(device const bfloat4 *) (wrow + e));
+-            const float4 b1 = float4(*(device const bfloat4 *) (wrow + e + 4));
+-            s += dot(b0, *(threadgroup const float4 *) (a + e)) + dot(b1, *(threadgroup const float4 *) (a + e + 4));
++    const int part8 = tiisg%8;
++    const int per  = n_lo/8;   // elements per lane per row (multiple of 8)
++
++    threadgroup const float * a = shmem + part8*per;
++    for (int i = g; (args.phases & 2) && i < n_embd; i += NO*n_sg) {
++        float s[NO];
++        FOR_UNROLL (int o = 0; o < NO; ++o) {
++            s[o] = 0.0f;
+         }
+-        s += simd_shuffle_xor(s, 1);
+-        s += simd_shuffle_xor(s, 2);
+-        s += simd_shuffle_xor(s, 4);
+-
+-        const float xv  = *(device const float *) (x  + c*args.nb_x1  + i*sizeof(float));
+-        const float wv  = *(device const float *) (wn + c*args.nb_wn1 + i*sizeof(float));
+-        const float xn  = (xv*r[c])*wv;
+-        const float gt  = 1.0f/(1.0f + exp(-s));
+-
+-        float result = 0.0f;
+-        FOR_UNROLL (int cc = 0; cc < hc; ++cc) {
+-            result = fma(simd_shuffle(xn, cc*8), simd_shuffle(gt, cc*8), result);
++        for (int e = 0; e < per; e += 8) {
++            bfloat4 w0[NO];
++            bfloat4 w1[NO];
++            FOR_UNROLL (int o = 0; o < NO; ++o) {
++                const int io = min(i + o*n_sg, n_embd - 1);
++                device const bfloat * wrow = (device const bfloat *) (wu + (c*n_embd + io)*args.nb_up1) + part8*per + e;
++                w0[o] = *(device const bfloat4 *) (wrow);
++                w1[o] = *(device const bfloat4 *) (wrow + 4);
++            }
++            const float4 a0 = *(threadgroup const float4 *) (a + e);
++            const float4 a1 = *(threadgroup const float4 *) (a + e + 4);
++            FOR_UNROLL (int o = 0; o < NO; ++o) {
++                s[o] += dot(float4(w0[o]), a0) + dot(float4(w1[o]), a1);
++            }
+         }
+-        if (tiisg == 0) {
+-            *(device float *) (mixed + i*args.nb_mix_d0) = args.pre_scale*result;
++
++        FOR_UNROLL (int o = 0; o < NO; ++o) {
++            const int io = i + o*n_sg;
++            float so = s[o];
++            so += simd_shuffle_xor(so, 1);
++            so += simd_shuffle_xor(so, 2);
++            so += simd_shuffle_xor(so, 4);
++            if (io >= n_embd) {
++                continue;
++            }
++
++            const float xv = *(device const float *) (x  + c*args.nb_x1  + io*sizeof(float));
++            const float wv = *(device const float *) (wn + c*args.nb_wn1 + io*sizeof(float));
++            const float xn = (xv*r[c])*wv;
++            const float gt = 1.0f/(1.0f + exp(-so));
++
++            float result = 0.0f;
++            FOR_UNROLL (int cc = 0; cc < hc; ++cc) {
++                result = fma(simd_shuffle(xn, cc*8), simd_shuffle(gt, cc*8), result);
++            }
++            if (tiisg == 0) {
++                *(device float *) (mixed + io*args.nb_mix_d0) = args.pre_scale*result;
++            }
+         }
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,445 @@
+From b574db59f56f93724e1ae26e02f6beb9c16a69e2 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 17:02:58 +0900
+Subject: [PATCH 41/49] metal: fewer stages on the verify pass (outputs
+ bit-identical)
+
+- graph reorder may move CONCAT/SOFT_MAX/DSV4_HC_PRE/POST/FILL/CUMSUM/ARGSORT/TOP_K/GATED_DELTA_NET/FLASH_ATTN_EXT/LIGHTNING_INDEXER
+  (memory access fully described by src/dst; GGML_METAL_REORDER_EXT=0 disables; GGML_METAL_REORDER_FWD look-ahead)
+- MoE reduce fusion for 9..16 experts (fusion max 32 nodes); product rounded alone (precise::fma(e,w,0)) = unfused MUL+ADD
+- MoE reduce + following ADD (shared expert) in one dispatch (GGML_METAL_FUSE_MOE_ADD)
+- SCALE + SILU in one dispatch (GGML_METAL_FUSE_SCALE_SILU)
+- RMS_NORM + MUL + MUL (gated norm) in one dispatch (GGML_METAL_FUSE_NORM_MUL_MUL)
+B=3 verify 29.56 -> 27.8 ms, B=1 20.50 -> 19.5 ms, barriers 1993 -> 1610
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-common.cpp | 18 ++++-
+ ggml/src/ggml-metal/ggml-metal-device.cpp | 20 ++++++
+ ggml/src/ggml-metal/ggml-metal-device.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 52 +++++++++++++-
+ ggml/src/ggml-metal/ggml-metal-fusion.h   |  3 +-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 82 +++++++++++++++++++++--
+ ggml/src/ggml-metal/kernels/argsort.metal | 31 ++++++++-
+ ggml/src/ggml-metal/kernels/norm.metal    |  5 ++
+ ggml/src/ggml-metal/kernels/unary.metal   | 16 +++++
+ 9 files changed, 220 insertions(+), 8 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-common.cpp b/ggml/src/ggml-metal/ggml-metal-common.cpp
+index 28bfe0b..bd8b012 100644
+--- a/ggml/src/ggml-metal/ggml-metal-common.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-common.cpp
+@@ -486,6 +486,22 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
+             case GGML_OP_CONT:
+             case GGML_OP_REPEAT:
+                 return true;
++            // GGML_METAL_REORDER_EXT (default on): ops of the hybrid models whose memory access is fully described by src/dst
++            case GGML_OP_CONCAT:
++            case GGML_OP_SOFT_MAX:
++            case GGML_OP_DSV4_HC_PRE:
++            case GGML_OP_DSV4_HC_POST:
++            case GGML_OP_FILL:
++            case GGML_OP_CUMSUM:
++            case GGML_OP_ARGSORT:
++            case GGML_OP_TOP_K:
++            case GGML_OP_GATED_DELTA_NET:
++            case GGML_OP_FLASH_ATTN_EXT:
++            case GGML_OP_LIGHTNING_INDEXER:
++                {
++                    static const bool ext = getenv("GGML_METAL_REORDER_EXT") == nullptr || atoi(getenv("GGML_METAL_REORDER_EXT")) != 0;
++                    return ext;
++                }
+             default:
+                 return ggml_op_is_empty(op);
+         }
+@@ -524,7 +540,7 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
+             h_add(mrs1, node0);
+ 
+             // that many nodes forward to search for a concurrent node
+-            constexpr int N_FORWARD = 64;
++            static const int N_FORWARD = getenv("GGML_METAL_REORDER_FWD") ? atoi(getenv("GGML_METAL_REORDER_FWD")) : 64;
+ 
+             for (int i1 = i0 + 1; i1 < i0 + N_FORWARD && i1 < n; i1++) {
+                 if (used[i1]) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 832f947..302a326 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1780,6 +1780,26 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe(
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce_add(ggml_metal_library_t lib, int32_t n_expert_used) {
++    char base[256];
++    char name[256];
++
++    snprintf(base, 256, "kernel_moe_reduce_add_f32");
++    snprintf(name, 256, "%s_n_expert_used=%d", base, n_expert_used);
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
++        ggml_metal_cv_set_int32(cv, n_expert_used, FC_MOE_REDUCE + 0);
++
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce(ggml_metal_library_t lib, int32_t n_expert_used) {
+     char base[256];
+     char name[256];
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index 7042535..a184ea6 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -167,6 +167,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_rad
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge       (ggml_metal_library_t lib, const struct ggml_tensor * op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe          (ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce        (ggml_metal_library_t lib, int32_t n_expert_used);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_reduce_add    (ggml_metal_library_t lib, int32_t n_expert_used);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin               (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_bin_one           (ggml_metal_library_t lib, enum ggml_op op);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm           (ggml_metal_library_t lib, const struct ggml_tensor * op);
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index 5f8a5eb..d2936a3 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -500,7 +500,7 @@ static bool ggml_metal_fusion_check_topk_moe(
+     return true;
+ }
+ 
+-#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 8
++#define GGML_METAL_MOE_REDUCE_MAX_EXPERTS 16
+ 
+ struct ggml_metal_moe_reduce_match {
+     const ggml_tensor * experts;
+@@ -714,6 +714,7 @@ static const std::vector<ggml_op> ops_norm_scale       = { GGML_OP_NORM, GGML_OP
+ static const std::vector<ggml_op> ops_rms_norm_mul     = { GGML_OP_RMS_NORM, GGML_OP_MUL };
+ static const std::vector<ggml_op> ops_rms_norm_mul_add = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+ static const std::vector<ggml_op> ops_rms_norm_scale   = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
++static const std::vector<ggml_op> ops_rms_norm_mul_mul = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL };
+ 
+ static const std::vector<ggml_op> ops_add_2 = { GGML_OP_ADD, GGML_OP_ADD };
+ static const std::vector<ggml_op> ops_add_3 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
+@@ -754,6 +755,46 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
+     GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
+     GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
+ };
++static const std::vector<ggml_op> ops_moe_reduce_9 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_10 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_11 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_12 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_13 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_14 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_15 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
++static const std::vector<ggml_op> ops_moe_reduce_16 = {
++    GGML_OP_MUL,
++    GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++    GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD
++};
+ 
+ static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+ 
+@@ -954,6 +995,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_NORM_MUL,       ops_rms_norm_mul,           {},     false, ggml_metal_fusion_check_norm },
+     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_rms_norm_mul_add,       {},     false, ggml_metal_fusion_check_norm },
+     { GGML_METAL_FUSION_NORM_SCALE,     ops_rms_norm_scale,         {},     false, ggml_metal_fusion_check_norm },
++    { GGML_METAL_FUSION_NORM_MUL_MUL,   ops_rms_norm_mul_mul,       {},     false, ggml_metal_fusion_check_norm },
+     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_2,                  {},     false, ggml_metal_fusion_check_add_chain },
+     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_3,                  {},     false, ggml_metal_fusion_check_add_chain },
+     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_4,                  {},     false, ggml_metal_fusion_check_add_chain },
+@@ -973,6 +1015,14 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_6,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_9,           {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_10,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_11,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_12,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_13,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_14,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_15,          {},     true,  ggml_metal_fusion_check_moe_reduce },
++    { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_16,          {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
+     { GGML_METAL_FUSION_HC_POST_GATE,   ops_hc_post_gate,           {},     true,  ggml_metal_fusion_check_hc_post_gate },
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 6433255..44231d9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -20,7 +20,7 @@ struct ggml_metal_device_props;
+ 
+ // the maximum number of nodes that can be fused in a single kernel
+ // (also the maximum length of a packed fusion group during graph optimization)
+-#define GGML_METAL_FUSION_MAX 16
++#define GGML_METAL_FUSION_MAX 32
+ 
+ typedef enum ggml_metal_fusion_mode {
+     // structural checks for the graph optimizer, which runs before the graph tensors are allocated (weights
+@@ -35,6 +35,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_NONE = 0,
+     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
+     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
++    GGML_METAL_FUSION_NORM_MUL_MUL, // RMS_NORM + MUL + MUL (gated norm)
+     GGML_METAL_FUSION_NORM_SCALE,   // NORM/RMS_NORM + SCALE
+     GGML_METAL_FUSION_ADD_CHAIN,    // ADD x N (N in [2, 7])
+     GGML_METAL_FUSION_SNAKE,        // MUL + SIN + SQR + MUL + ADD
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index e725e4b..74ba9d0 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1080,6 +1080,41 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+         }
+     }
+ 
++    // SCALE + SILU of its result in one dispatch
++    if (op->op == GGML_OP_SCALE && ctx->use_fusion() && idx + 1 < ctx->n_nodes()) {
++        static const bool en = getenv("GGML_METAL_FUSE_SCALE_SILU") == nullptr || atoi(getenv("GGML_METAL_FUSE_SCALE_SILU")) != 0;
++        ggml_tensor * nx = ctx->node(idx + 1);
++        if (en && nx->op == GGML_OP_UNARY && ggml_get_unary_op(nx) == GGML_UNARY_OP_SILU && nx->src[0] == op &&
++            op->type == GGML_TYPE_F32 && nx->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op) && ggml_is_contiguous(nx) &&
++            ggml_nelements(op) == ggml_nelements(op->src[0]) && ggml_nelements(nx) == ggml_nelements(op)) {
++            if (ctx->mem_ranges && !ggml_mem_ranges_check(ctx->mem_ranges, nx)) {
++                ggml_metal_op_concurrency_reset(ctx);
++            }
++            ggml_metal_kargs_unary args = {};
++            args.ne0   = (int32_t) ggml_nelements(op);
++            args.scale = ggml_get_op_params_f32(op, 0);
++            args.bias  = ggml_get_op_params_f32(op, 1);
++            static ggml_metal_pipeline_with_params pl = {};
++            if (!pl.pipeline) {
++                pl = ggml_metal_library_get_pipeline(ctx->lib, "kernel_scale_silu_f32");
++                if (!pl.pipeline) {
++                    pl = ggml_metal_library_compile_pipeline(ctx->lib, "kernel_scale_silu_f32", "kernel_scale_silu_f32", nullptr);
++                }
++            }
++            ggml_metal_encoder_set_pipeline(ctx->enc, pl);
++            ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op->src[0]), 1);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(op), 2);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(nx), 3);
++            const int n = args.ne0;
++            const int nth = std::min(256, n);
++            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n + nth - 1)/nth, 1, 1, nth, 1, 1);
++            return 2;
++        }
++    }
++
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+@@ -4960,6 +4995,7 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
+ 
+     int n_fuse = 1;
+     bool fused_norm_scale = false;
++    bool norm_mul_mul = false;
+ 
+     ggml_metal_buffer_id bid_fuse[2] = { bid_src0, bid_src0 };
+ 
+@@ -4970,7 +5006,8 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
+         int n = 1;
+         const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+ 
+-        if (fusion && (ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL || ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL_ADD)) {
++        norm_mul_mul = fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL_MUL;
++        if (fusion && (ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL || ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_NORM_MUL_ADD || norm_mul_mul)) {
+             n_fuse = n;
+ 
+             ctx->count_fusions(fusion);
+@@ -5026,7 +5063,19 @@ int ggml_metal_op_norm(ggml_metal_op_t ctx, int idx) {
+         }
+     }
+ 
+-    auto pipeline = fused_norm_scale ?
++    ggml_metal_pipeline_with_params pipeline_mm = {};
++    if (norm_mul_mul) {
++        const char * nm = op->ne[0] % 4 == 0 ? "kernel_rms_norm_mul_mul_f32_4" : "kernel_rms_norm_mul_mul_f32";
++        pipeline_mm = ggml_metal_library_get_pipeline(lib, nm);
++        if (!pipeline_mm.pipeline) {
++            ggml_metal_cv_t cv = ggml_metal_cv_init();
++            ggml_metal_cv_set_bool(cv, false, FC_NORM + 0);
++            pipeline_mm = ggml_metal_library_compile_pipeline(lib, nm, nm, cv);
++            ggml_metal_cv_free(cv);
++        }
++        pipeline_mm.smem = 32*sizeof(float);
++    }
++    auto pipeline = norm_mul_mul ? pipeline_mm : fused_norm_scale ?
+         ggml_metal_library_get_pipeline_norm_scale(lib, op) :
+         ggml_metal_library_get_pipeline_norm(lib, op, n_fuse);
+ 
+@@ -6330,7 +6379,27 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
+         /*.ne02 =*/ (int32_t) experts->ne[2],
+     };
+ 
+-    auto pipeline = ggml_metal_library_get_pipeline_moe_reduce(lib, (int32_t) experts->ne[1]);
++    // the next node adds another tensor to the reduced output (MoE out + shared expert): one dispatch writes both
++    ggml_tensor * add = nullptr;
++    {
++        static const bool en = getenv("GGML_METAL_FUSE_MOE_ADD") == nullptr || atoi(getenv("GGML_METAL_FUSE_MOE_ADD")) != 0;
++        if (en && idx + n_fuse < ctx->n_nodes()) {
++            ggml_tensor * nx = ctx->node(idx + n_fuse);
++            if (nx->op == GGML_OP_ADD && nx->type == GGML_TYPE_F32 && (nx->src[0] == dst) != (nx->src[1] == dst)) {
++                const ggml_tensor * oth = nx->src[0] == dst ? nx->src[1] : nx->src[0];
++                if (oth->type == GGML_TYPE_F32 && ggml_are_same_shape(oth, dst) && ggml_are_same_shape(nx, dst) &&
++                    ggml_is_contiguous(oth) && ggml_is_contiguous(nx) && ggml_is_contiguous(dst)) {
++                    add = nx;
++                }
++            }
++        }
++    }
++    if (add && ctx->mem_ranges && !ggml_mem_ranges_check(ctx->mem_ranges, add)) {
++        ggml_metal_op_concurrency_reset(ctx);
++    }
++
++    auto pipeline = add ? ggml_metal_library_get_pipeline_moe_reduce_add(lib, (int32_t) experts->ne[1])
++                        : ggml_metal_library_get_pipeline_moe_reduce    (lib, (int32_t) experts->ne[1]);
+ 
+     const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+     const int n_col_tiles = (args.ne00 + nth - 1) / nth;
+@@ -6340,6 +6409,11 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(experts), 1);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
+     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),     3);
++    if (add) {
++        const ggml_tensor * oth = add->src[0] == dst ? add->src[1] : add->src[0];
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(oth), 4);
++        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(add), 5);
++    }
+ 
+     ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) args.ne02, (uint32_t) n_col_tiles, 1, nth, 1, 1);
+ 
+@@ -6349,7 +6423,7 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
+         GGML_LOG_DEBUG("%s: fuse: MOE_REDUCE\n", __func__);
+     }
+ 
+-    return n_fuse;
++    return add ? n_fuse + 1 : n_fuse;
+ }
+ 
+ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
+diff --git a/ggml/src/ggml-metal/kernels/argsort.metal b/ggml/src/ggml-metal/kernels/argsort.metal
+index 5231b83..7435938 100644
+--- a/ggml/src/ggml-metal/kernels/argsort.metal
++++ b/ggml/src/ggml-metal/kernels/argsort.metal
+@@ -473,7 +473,36 @@ kernel void kernel_moe_reduce_f32(
+     const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
+     float sum = 0.0f;
+     FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
+-        sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
++        // product rounded on its own, then added: bit-identical to the unfused MUL + ADD chain (no fma contraction)
++        sum = sum + metal::precise::fma(experts[base + e * args.ne00], weights[token * n_expert_used + e], 0.0f);
+     }
+     dst[token * args.ne00 + col] = sum;
+ }
++
++// MoE reduce and the following residual-style ADD: dst = sum_e(experts[e]*weights[e]); dst2 = dst + other
++kernel void kernel_moe_reduce_add_f32(
++        constant   ggml_metal_kargs_moe_reduce & args,
++        device const float * experts,
++        device const float * weights,
++        device       float * dst,
++        device const float * other,
++        device       float * dst2,
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    const int64_t token = tgpig.x;
++    const int64_t col   = (int64_t) tgpig.y * ntg.x + tpitg.x;
++    if (token >= args.ne02 || col >= args.ne00) {
++        return;
++    }
++
++    const int n_expert_used = FC_moe_reduce_n_expert_used;
++
++    const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
++    float sum = 0.0f;
++    FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
++        sum = sum + metal::precise::fma(experts[base + e * args.ne00], weights[token * n_expert_used + e], 0.0f);
++    }
++    dst[token * args.ne00 + col] = sum;
++    dst2[token * args.ne00 + col] = sum + other[token * args.ne00 + col];
++}
+diff --git a/ggml/src/ggml-metal/kernels/norm.metal b/ggml/src/ggml-metal/kernels/norm.metal
+index c76d0c7..68520e3 100644
+--- a/ggml/src/ggml-metal/kernels/norm.metal
++++ b/ggml/src/ggml-metal/kernels/norm.metal
+@@ -170,6 +170,9 @@ kernel void kernel_rms_norm_fuse_impl(
+         if (F == 3) {
+             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
+         }
++        if (F == 4) {
++            y[i00] = ((x[i00]*scale)*f0[i00])*f1[i00];
++        }
+     }
+ }
+ 
+@@ -182,6 +185,8 @@ template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fus
+ template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
+ template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
+ template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
++template [[host_name("kernel_rms_norm_mul_mul_f32")]]   kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float, 4>;
++template [[host_name("kernel_rms_norm_mul_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 4>;
+ 
+ template <typename T0, typename T>
+ kernel void kernel_l2_norm_impl(
+diff --git a/ggml/src/ggml-metal/kernels/unary.metal b/ggml/src/ggml-metal/kernels/unary.metal
+index bbf53a5..a36c57b 100644
+--- a/ggml/src/ggml-metal/kernels/unary.metal
++++ b/ggml/src/ggml-metal/kernels/unary.metal
+@@ -401,3 +401,19 @@ typedef decltype(kernel_geglu_quick<float>) kernel_geglu_quick_t;
+ 
+ template [[host_name("kernel_geglu_quick_f32")]] kernel kernel_geglu_quick_t kernel_geglu_quick<float>;
+ template [[host_name("kernel_geglu_quick_f16")]] kernel kernel_geglu_quick_t kernel_geglu_quick<half>;
++
++// fused SCALE + SILU over contiguous f32: t = scale*x + bias (written), y = t/(1 + exp(-t)) (written)
++kernel void kernel_scale_silu_f32(
++        constant ggml_metal_kargs_unary & args,
++        device const float * src0,
++        device       float * dst_t,
++        device       float * dst_y,
++        uint tid[[thread_position_in_grid]]) {
++    if ((int) tid >= args.ne0) {
++        return;
++    }
++    const float x = src0[tid];
++    const float t = (float) (args.scale * x + args.bias);
++    dst_t[tid] = t;
++    dst_y[tid] = (float) (t / (1 + exp(-t)));
++}
+-- 
+2.50.1 (Apple Git-155)
+

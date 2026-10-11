@@ -1,0 +1,100 @@
+From 55a2f7a63fafca2cb41da3092ec882c7a6c0a0df Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 21:28:20 +0900
+Subject: [PATCH 01/49] metal: GGML_METAL_TIMING per-graph GPU timing
+
+---
+ ggml/src/ggml-metal/ggml-metal-context.m | 49 ++++++++++++++++++++++++
+ 1 file changed, 49 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml-metal-context.m
+index e906466..701c17d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-context.m
++++ b/ggml/src/ggml-metal/ggml-metal-context.m
+@@ -82,6 +82,12 @@
+     // error state - set when a command buffer fails during synchronize
+     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
+     bool has_error;
++
++    // optional per-graph timing (GGML_METAL_TIMING=1): host encode time vs GPU execution time
++    int    timing;
++    int    t_nodes;
++    double t_submit;
++    double t_encoded;
+ };
+ 
+ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+@@ -146,6 +152,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
+             res->debug_graph = val ? atoi(val) : 0;
+         }
+ 
++        {
++            const char * val = getenv("GGML_METAL_TIMING");
++            res->timing   = val ? atoi(val) : 0;
++            res->t_submit = 0.0;
++        }
++
+         res->use_graph_optimize = true;
+ 
+         if (getenv("GGML_METAL_GRAPH_OPTIMIZE_DISABLE") != NULL) {
+@@ -280,6 +292,34 @@ void ggml_metal_synchronize(ggml_metal_t ctx) {
+         }
+     }
+ 
++    if (ctx->timing && ctx->t_submit > 0.0) {
++        const double t_done = [[NSProcessInfo processInfo] systemUptime];
++        double g0 = 0.0, g1 = 0.0, gsum = 0.0;
++        for (int cb_idx = 0; cb_idx <= ctx->n_cb; ++cb_idx) {
++            id<MTLCommandBuffer> cb = ctx->cmd_bufs[cb_idx].obj;
++            if (!cb) {
++                continue;
++            }
++            const double s0 = [cb GPUStartTime];
++            const double s1 = [cb GPUEndTime];
++            if (s0 <= 0.0 || s1 <= 0.0) {
++                continue;
++            }
++            if (g0 == 0.0 || s0 < g0) {
++                g0 = s0;
++            }
++            if (s1 > g1) {
++                g1 = s1;
++            }
++            gsum += s1 - s0;
++        }
++        fprintf(stderr, "metal-timing: nodes=%d n_cb=%d encode=%.3f gpu_span=%.3f gpu_sum=%.3f first_gpu=%.3f wall=%.3f ms\n",
++                ctx->t_nodes, ctx->n_cb,
++                1e3*(ctx->t_encoded - ctx->t_submit), 1e3*(g1 - g0), 1e3*gsum,
++                1e3*(g0 - ctx->t_submit), 1e3*(t_done - ctx->t_submit));
++        ctx->t_submit = 0.0;
++    }
++
+     // release any completed extra command buffers
+     if (ctx->cmd_bufs_ext.count > 0) {
+         for (size_t i = 0; i < ctx->cmd_bufs_ext.count; ++i) {
+@@ -500,6 +540,11 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+     @autoreleasepool {
+         ctx->gf = gf;
+ 
++        if (ctx->timing) {
++            ctx->t_submit = [[NSProcessInfo processInfo] systemUptime];
++            ctx->t_nodes  = gf->n_nodes;
++        }
++
+         if (ctx->n_cb == 0) {
+             // single-threaded encoding: the whole graph is encoded by one command buffer
+             ctx->n_nodes_0      = gf->n_nodes;
+@@ -594,6 +639,10 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
+ 
+         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+ 
++        if (ctx->timing) {
++            ctx->t_encoded = [[NSProcessInfo processInfo] systemUptime];
++        }
++
+         // for debugging: block until graph is computed
+         //[ctx->cmd_buf_last waitUntilCompleted];
+ 
+-- 
+2.50.1 (Apple Git-155)
+

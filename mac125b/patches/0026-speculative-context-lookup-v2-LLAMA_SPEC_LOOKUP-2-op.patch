@@ -1,0 +1,141 @@
+From 00c85e01973e6bd61a1987f789f95d72bbd62f49 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 00:24:56 +0900
+Subject: [PATCH 26/49] speculative: context lookup v2 (LLAMA_SPEC_LOOKUP=2,
+ opt-in)
+
+---
+ common/speculative.cpp | 89 +++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 88 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index f04d134..7e0b1ae 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1480,6 +1480,34 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     int32_t lk_max     = 8;
+     uint64_t lk_rounds = 0, lk_hits = 0;
+ 
++    int32_t lk_mode = 0;                      // 1 = v1 (MTP-agreed 3/4-gram), 2 = v2 (longest match)
++    int32_t lk_len  = 16;                     // adaptive draft length of v2
++    std::vector<int32_t> lk_last;             // length of the lookup draft of the last round per seq (0 = MTP)
++    uint64_t lk2_rounds = 0, lk2_drafted = 0, lk2_accepted = 0;
++
++    // longest match of the suffix of (tok + id_last) that ends before the current position;
++    // returns match length (0 if < 3) and the continuation start in `c0`
++    static int32_t lookup_longest(const llama_tokens & tok, llama_token id_last, int64_t & c0) {
++        const int64_t n = (int64_t) tok.size();
++        int32_t best = 0;
++        c0 = -1;
++        // candidate end positions e (tok[e] == id_last), most recent first
++        for (int64_t e = n - 1; e >= 1; --e) {
++            if (tok[e] != id_last) continue;
++            if (e + 1 >= n) continue;               // need a continuation
++            int32_t m = 1;
++            while (m < 32 && e - m >= 0 && n - m >= 0 && tok[e - m] == tok[n - m]) {
++                m++;
++            }
++            if (m > best) {
++                best = m;
++                c0 = e + 1;
++                if (best >= 32) break;
++            }
++        }
++        return best >= 3 ? best : 0;
++    }
++
+     // history = tokens + id_last + d1 (virtual); returns d1 + continuation of the latest earlier match
+     static bool lookup_find(const llama_tokens & tok, llama_token id_last, llama_token d1, int32_t n_max, llama_tokens & out) {
+         const int64_t n = (int64_t) tok.size();
+@@ -1533,7 +1561,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
+         ev.init();
+-        if (const char * e = getenv("LLAMA_SPEC_LOOKUP")) lk_enabled = atoi(e) != 0;
++        if (const char * e = getenv("LLAMA_SPEC_LOOKUP")) { lk_mode = atoi(e); lk_enabled = lk_mode == 1; }
++        lk_last.assign(n_seq, 0);
++        if (lk_mode == 2) {
++            LOG_INF("%s: context lookup v2 on (longest match, adaptive length, cap %d)\n", __func__, (int) params.draft.n_max);
++        }
+         if (const char * e = getenv("LLAMA_SPEC_LOOKUP_MAX")) lk_max = std::max(2, atoi(e));
+         if (const char * e = getenv("LLAMA_SPEC_MTP_DEPTH")) mtp_depth = std::max(1, atoi(e));
+         if (lk_enabled) {
+@@ -1788,6 +1820,26 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_sampler_reset(smpls[seq_id].get());
+             }
+ 
++            lk_last[seq_id] = 0;
++            if (lk_mode == 2 && !dp.result_q) {
++                int64_t c0 = -1;
++                const int32_t m = lookup_longest(*dp.prompt, dp.id_last, c0);
++                if (m >= 12) {
++                    const int32_t cap = std::min<int32_t>(lk_len, params.n_max);
++                    auto & res = *dp.result;
++                    res.clear();
++                    for (int64_t c = c0; c < (int64_t) dp.prompt->size() && (int32_t) res.size() < cap; ++c) {
++                        res.push_back((*dp.prompt)[c]);
++                    }
++                    if (!res.empty()) {
++                        lk_last[seq_id] = (int32_t) res.size();
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++                }
++            }
++
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+@@ -1861,6 +1913,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                     continue;
+                 }
+ 
++                if (lk_mode == 2 && i == 0 && !dparams.at(seq_id).result_q) {
++                    int64_t c0 = -1;
++                    const auto & hist = *dparams.at(seq_id).prompt;
++                    const int32_t m = lookup_longest(hist, dparams.at(seq_id).id_last, c0);
++                    if (m >= 3 && c0 >= 0 && c0 < (int64_t) hist.size() && hist[c0] == id) {
++                        const int32_t cap = std::min<int32_t>(std::max<int32_t>(8, lk_len/2), params.n_max);
++                        auto & res = *dparams.at(seq_id).result;
++                        res.clear();
++                        for (int64_t c = c0; c < (int64_t) hist.size() && (int32_t) res.size() < cap; ++c) {
++                            res.push_back(hist[c]);
++                        }
++                        lk_last[seq_id] = (int32_t) res.size();
++                        drafting[seq_id] = false;
++                        n_drafting--;
++                        continue;
++                    }
++                }
++
+                 // MTP-agreed context lookup: the first MTP token selects a continuation from the history
+                 if (lk_enabled && i == 0 && !dparams.at(seq_id).result_q) {
+                     lk_rounds++;
+@@ -1975,6 +2045,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        if (lk_mode == 2 && lk_last[seq_id] > 0) {
++            const int32_t L = lk_last[seq_id];
++            lk2_rounds++;
++            lk2_drafted  += L;
++            lk2_accepted += n_accepted;
++            if (n_accepted >= L) {
++                lk_len = std::min<int32_t>(lk_len*2, params.n_max);
++            } else if (4*n_accepted < L) {
++                lk_len = std::max<int32_t>(8, lk_len/2);
++            }
++            if (lk2_rounds % 50 == 0) {
++                LOG_INF("%s: lookup v2 rounds %llu, drafted %llu, accepted %llu, len %d\n", __func__,
++                        (unsigned long long) lk2_rounds, (unsigned long long) lk2_drafted, (unsigned long long) lk2_accepted, lk_len);
++            }
++            lk_last[seq_id] = 0;
++        }
++
+         if (ev.enabled && !ev_last_p[seq_id].empty()) {
+             // calibration: every drafted token up to and including the first rejection was "tried"
+             const auto & lp = ev_last_p[seq_id];
+-- 
+2.50.1 (Apple Git-155)
+

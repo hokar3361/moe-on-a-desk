@@ -1,0 +1,172 @@
+From 6eb4390267bf07445aa18b0fa706188baa109413 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 17:29:40 +0900
+Subject: [PATCH 44/49] qwen4exp/metal: GDN decay gate ADD+SOFTPLUS+MUL in one
+ dispatch (registered fusion), gated norm builds sigmoid(z) first so
+ RMS_NORM+MUL+MUL fuse (bit-identical); barriers 1325 -> 1282
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 20 ++++++++++++
+ ggml/src/ggml-metal/ggml-metal-fusion.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 39 +++++++++++++++++++++++
+ ggml/src/ggml-metal/kernels/unary.metal   | 22 +++++++++++++
+ src/models/qwen4exp.cpp                   |  4 ++-
+ 5 files changed, 85 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index d2936a3..adfbbba 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -641,6 +641,24 @@ static bool ggml_metal_fusion_check_moe_reduce(
+     return true;
+ }
+ 
++// ADD -> SOFTPLUS -> MUL chain (GDN decay gate), encoded by ggml_metal_op_bin
++static bool ggml_metal_fusion_check_gdn_gate(
++        const ggml_metal_fusion       * fusion,
++        const ggml_tensor * const     * nodes,
++        const ggml_cgraph             * gf,
++        const int                     * node_idxs,
++              int                       idx,
++              ggml_metal_fusion_mode    mode) {
++    GGML_UNUSED(fusion); GGML_UNUSED(gf); GGML_UNUSED(node_idxs); GGML_UNUSED(idx); GGML_UNUSED(mode);
++    static const bool en = getenv("GGML_METAL_FUSE_GDN_GATE") == nullptr || atoi(getenv("GGML_METAL_FUSE_GDN_GATE")) != 0;
++    const ggml_tensor * ad = nodes[0];
++    const ggml_tensor * sp = nodes[1];
++    const ggml_tensor * ml = nodes[2];
++    return en && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS && sp->src[0] == ad && ml->src[0] == sp &&
++           ad->type == GGML_TYPE_F32 && ml->type == GGML_TYPE_F32 && ggml_nelements(ad->src[1]) == ad->ne[0] &&
++           ggml_nelements(ml->src[1]) == ad->ne[0];
++}
++
+ // true if t is or views a tensor in a buffer marked as weights, such as a bias; the model loader marks its buffers before
+ // any graph is optimized, and tensors in unmarked or not yet allocated buffers count as non-weights in both phases
+ static bool ggml_metal_tensor_is_weight(const struct ggml_tensor * t) {
+@@ -715,6 +733,7 @@ static const std::vector<ggml_op> ops_rms_norm_mul     = { GGML_OP_RMS_NORM, GGM
+ static const std::vector<ggml_op> ops_rms_norm_mul_add = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD };
+ static const std::vector<ggml_op> ops_rms_norm_scale   = { GGML_OP_RMS_NORM, GGML_OP_SCALE };
+ static const std::vector<ggml_op> ops_rms_norm_mul_mul = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_MUL };
++static const std::vector<ggml_op> ops_gdn_gate         = { GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL };
+ 
+ static const std::vector<ggml_op> ops_add_2 = { GGML_OP_ADD, GGML_OP_ADD };
+ static const std::vector<ggml_op> ops_add_3 = { GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
+@@ -996,6 +1015,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_rms_norm_mul_add,       {},     false, ggml_metal_fusion_check_norm },
+     { GGML_METAL_FUSION_NORM_SCALE,     ops_rms_norm_scale,         {},     false, ggml_metal_fusion_check_norm },
+     { GGML_METAL_FUSION_NORM_MUL_MUL,   ops_rms_norm_mul_mul,       {},     false, ggml_metal_fusion_check_norm },
++    { GGML_METAL_FUSION_GDN_GATE,       ops_gdn_gate,               {},     false, ggml_metal_fusion_check_gdn_gate },
+     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_2,                  {},     false, ggml_metal_fusion_check_add_chain },
+     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_3,                  {},     false, ggml_metal_fusion_check_add_chain },
+     { GGML_METAL_FUSION_ADD_CHAIN,      ops_add_4,                  {},     false, ggml_metal_fusion_check_add_chain },
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 44231d9..38618a7 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -36,6 +36,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
+     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
+     GGML_METAL_FUSION_NORM_MUL_MUL, // RMS_NORM + MUL + MUL (gated norm)
++    GGML_METAL_FUSION_GDN_GATE,     // ADD + SOFTPLUS + MUL (GDN decay gate)
+     GGML_METAL_FUSION_NORM_SCALE,   // NORM/RMS_NORM + SCALE
+     GGML_METAL_FUSION_ADD_CHAIN,    // ADD x N (N in [2, 7])
+     GGML_METAL_FUSION_SNAKE,        // MUL + SIN + SQR + MUL + ADD
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 8130900..447909d 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4704,6 +4704,45 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
+ 
+     const bool use_fusion = ctx->use_fusion();
+ 
++    // GDN decay gate: ADD(alpha, dt) -> SOFTPLUS -> MUL(., A) in one dispatch
++    if (use_fusion && idx + 2 < ctx->n_nodes()) {
++        static const bool en = getenv("GGML_METAL_FUSE_GDN_GATE") == nullptr || atoi(getenv("GGML_METAL_FUSE_GDN_GATE")) != 0;
++        ggml_tensor * ad = ctx->node(idx);
++        ggml_tensor * sp = ctx->node(idx + 1);
++        ggml_tensor * ml = ctx->node(idx + 2);
++        if (en && ad->op == GGML_OP_ADD && sp->op == GGML_OP_UNARY && ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS &&
++            sp->src[0] == ad && ml->op == GGML_OP_MUL && ml->src[0] == sp &&
++            ad->type == GGML_TYPE_F32 && sp->type == GGML_TYPE_F32 && ml->type == GGML_TYPE_F32 &&
++            ad->src[0]->type == GGML_TYPE_F32 && ad->src[1]->type == GGML_TYPE_F32 && ml->src[1]->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(ad->src[0]) && ggml_is_contiguous(ad) && ggml_is_contiguous(sp) && ggml_is_contiguous(ml) &&
++            ggml_are_same_shape(ad, ad->src[0]) && ggml_are_same_shape(sp, ad) && ggml_are_same_shape(ml, ad) &&
++            ggml_nelements(ad->src[1]) == ad->ne[0] && ggml_is_contiguous(ad->src[1]) &&
++            ggml_nelements(ml->src[1]) == ad->ne[0] && ggml_is_contiguous(ml->src[1])) {
++            if (ctx->mem_ranges && (!ggml_mem_ranges_check(ctx->mem_ranges, sp) || !ggml_mem_ranges_check(ctx->mem_ranges, ml))) {
++                ggml_metal_op_concurrency_reset(ctx);
++            }
++            static ggml_metal_pipeline_with_params pl = {};
++            if (!pl.pipeline) {
++                pl = ggml_metal_library_get_pipeline(ctx->lib, "kernel_gdn_gate_f32");
++                if (!pl.pipeline) {
++                    pl = ggml_metal_library_compile_pipeline(ctx->lib, "kernel_gdn_gate_f32", "kernel_gdn_gate_f32", nullptr);
++                }
++            }
++            const int nm[2] = { (int) ggml_nelements(ad), (int) ad->ne[0] };
++            ggml_metal_encoder_set_pipeline(ctx->enc, pl);
++            ggml_metal_encoder_set_bytes   (ctx->enc, (void *) nm, sizeof(nm), 0);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(ad->src[0]), 1);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(ad->src[1]), 2);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(ml->src[1]), 3);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(ad), 4);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(sp), 5);
++            ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(ml), 6);
++            const int nth = std::min(256, nm[0]);
++            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (nm[0] + nth - 1)/nth, 1, 1, nth, 1, 1);
++            return 3;
++        }
++    }
++
+     if (use_fusion) {
+         int n = 1;
+         fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+diff --git a/ggml/src/ggml-metal/kernels/unary.metal b/ggml/src/ggml-metal/kernels/unary.metal
+index a36c57b..223b7c3 100644
+--- a/ggml/src/ggml-metal/kernels/unary.metal
++++ b/ggml/src/ggml-metal/kernels/unary.metal
+@@ -417,3 +417,25 @@ kernel void kernel_scale_silu_f32(
+     dst_t[tid] = t;
+     dst_y[tid] = (float) (t / (1 + exp(-t)));
+ }
++
++// GDN decay gate: v = alpha + dt (broadcast rows), sp = softplus(v), g = sp*A (broadcast rows); every intermediate written
++kernel void kernel_gdn_gate_f32(
++        constant int2 & nm,              // n elements, row length m (dt and A have m elements)
++        device const float * alpha,
++        device const float * dt,
++        device const float * A,
++        device       float * out_add,
++        device       float * out_sp,
++        device       float * out_mul,
++        uint tid[[thread_position_in_grid]]) {
++    if ((int) tid >= nm.x) {
++        return;
++    }
++    const int j = tid % nm.y;
++    const float v = alpha[tid] + dt[j];
++    out_add[tid] = v;
++    const float x  = v;
++    const float sp = (float) select(log(1 + exp(x)), x, x > 20);
++    out_sp[tid]  = sp;
++    out_mul[tid] = sp * A[j];
++}
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 477bbf7..d5f5d6a 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -670,8 +670,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_norm_gated(
+         ggml_tensor * gate,
+         int           layer) {
+     // the one numerical difference from Qwen3.5's GDN: sigmoid output gate, not silu
+-    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
++    // the gate first, so that RMS_NORM -> MUL(w) -> MUL(gate) are adjacent in the graph and run as one fused kernel
+     ggml_tensor * gated = ggml_sigmoid(ctx0, gate);
++    ggml_build_forward_expand(gf, gated);
++    ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
+ 
+     return ggml_mul(ctx0, normalized, gated);
+ }
+-- 
+2.50.1 (Apple Git-155)
+

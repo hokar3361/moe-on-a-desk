@@ -1,0 +1,217 @@
+From 1c38e520b6602f2bdf1ab51673150b42e3c5b03b Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 20:41:27 +0900
+Subject: [PATCH 49/49] stop rule: lambda as a slow EMA (0.01/round, init
+ 0.09); fix: HC_POST+norm fusion refuses outputs overlapping its inputs
+ (without delayed frees the allocator reused the shared block output, ub>=64
+ prefill PPL 1.23 -> 253); register/shuffle bitonic top-k (same network,
+ identical output); QSA mask scattered from raw selected indices (dead slots
+ hit the sentinel row or causally masked cells)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp                    |  6 +-
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  4 +-
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 17 +++++-
+ ggml/src/ggml-metal/kernels/argsort.metal | 73 +++++++++++++++++++++++
+ src/models/qwen4exp.cpp                   | 12 ++++
+ 5 files changed, 108 insertions(+), 4 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index a2574c4..73d9708 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1578,7 +1578,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // verify GPU+host ms by width (index = tokens in the verify batch)
+         float tv[18] = { 0.0f, 17.9f, 21.85f, 25.8f, 28.63f, 31.47f, 34.3f, 37.65f, 41.0f, 44.0f, 47.0f, 50.0f, 53.0f, 56.0f, 59.0f, 62.0f, 65.0f, 68.0f };
+         float c_draft = 1.3f;
+-        float lam     = 0.07f;          // long-run tokens per ms, EMA over rounds
++        float lam     = 0.09f;          // long-run tokens per ms, slow EMA over rounds (fast tracking stops early after good rounds)
++        float lam_a   = 0.01f;          // EMA weight per round (LLAMA_SPEC_STOP_LAM_A)
+         float ema[18];                  // per-position acceptance EMA (0.9), reset per request
+         int   cap = 7, dmin = 1;
+         int64_t t_prev_us = 0;
+@@ -1831,6 +1832,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             sr.cap = params.draft.n_max;
+             if (const char * m = getenv("LLAMA_SPEC_DEPTH_MIN")) sr.dmin = std::max(1, atoi(m));
+             if (const char * e = getenv("LLAMA_SPEC_STOP_LAM")) sr.lam = (float) atof(e);
++            if (const char * e = getenv("LLAMA_SPEC_STOP_LAM_A")) sr.lam_a = (float) atof(e);
+             sr.reset_request();
+             LOG_INF("%s: draft stop rule on (cap %d, min %d)\n", __func__, sr.cap, sr.dmin);
+         }
+@@ -2137,7 +2139,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (sr.t_prev_us > 0 && sr.last_acc >= 0 && !sr.first_round) {
+                 const float ms = (now - sr.t_prev_us)/1000.0f;
+                 if (ms > 5.0f && ms < 150.0f) {
+-                    sr.lam = 0.9f*sr.lam + 0.1f*(sr.last_acc + 1)/ms;
++                    sr.lam = (1.0f - sr.lam_a)*sr.lam + sr.lam_a*(sr.last_acc + 1)/ms;
+                 }
+             }
+             sr.first_round = sr.t_prev_us == 0;
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 3f1fd4c..9fb70d9 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1741,7 +1741,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k(ggml_metal
+         default: GGML_ABORT("fatal error");
+     };
+ 
+-    snprintf(base, 256, "kernel_argsort_%s_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->type), order_str);
++    // GGML_METAL_TOPK_REG=0: the original kernel (the register version gives the same output)
++    static const bool reg = !getenv("GGML_METAL_TOPK_REG") || atoi(getenv("GGML_METAL_TOPK_REG")) != 0;
++    snprintf(base, 256, reg ? "kernel_argsort_reg_%s_%s_%s" : "kernel_argsort_%s_%s_%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->type), order_str);
+     snprintf(name, 256, "%s", base);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 4135fef..20a10c5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -259,6 +259,18 @@ static bool ggml_metal_op_concurrency_reset(ggml_metal_op_t ctx) {
+     return true;
+ }
+ 
++// true when the memory of a and b (their base tensors) overlaps
++static bool ggml_metal_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    const ggml_tensor * ba = a->view_src ? a->view_src : a;
++    const ggml_tensor * bb = b->view_src ? b->view_src : b;
++    if (ba->buffer != bb->buffer || !ba->data || !bb->data) {
++        return ba == bb;
++    }
++    const uint8_t * a0 = (const uint8_t *) ba->data, * a1 = a0 + ggml_nbytes(ba);
++    const uint8_t * b0 = (const uint8_t *) bb->data, * b1 = b0 + ggml_nbytes(bb);
++    return a0 < b1 && b0 < a1;
++}
++
+ static bool ggml_metal_op_concurrency_check(ggml_metal_op_t ctx, const ggml_tensor * node) {
+     if (!ctx->mem_ranges) {
+         return false;
+@@ -1065,6 +1077,8 @@ static int ggml_metal_op_hc_post_gate(ggml_metal_op_t ctx, int idx, int n_fuse)
+                 op->ne[0] % 4 == 0 && op->ne[0]/4 <= 1024 && op->ne[1] == 4 &&
+                 ggml_are_same_shape(nrm, op) && ggml_are_same_shape(mul, op) && wn->type == GGML_TYPE_F32 &&
+                 wn->ne[0] == op->ne[0] && wn->ne[1] == 4 && (wn->ne[2] == 1) && wn->nb[0] == 4 &&
++                !ggml_metal_tensors_overlap(mul, x) && !ggml_metal_tensors_overlap(mul, residual) &&
++                !ggml_metal_tensors_overlap(mul, inject) && !ggml_metal_tensors_overlap(mul, op) &&
+                 ggml_is_contiguous(op) && ggml_is_contiguous(mul) && x->nb[0] == 4 && residual->nb[0] == 4 &&
+                 x->nb[1] % 16 == 0 && residual->nb[1] % 16 == 0 && residual->nb[2] % 16 == 0 && wn->nb[1] % 16 == 0) {
+                 if (ctx->mem_ranges && (!ggml_mem_ranges_check(ctx->mem_ranges, nrm) || !ggml_mem_ranges_check(ctx->mem_ranges, mul))) {
+@@ -6313,7 +6327,8 @@ static void ggml_metal_op_top_k_bitonic(ggml_metal_op_t ctx, int idx) {
+     // blocks per row
+     const int npr = (ne00 + nth - 1)/nth;
+ 
+-    const size_t smem = GGML_PAD(nth*sizeof(int32_t), 16);
++    // indices + values (the register kernel exchanges both through threadgroup memory)
++    const size_t smem = GGML_PAD(2*nth*sizeof(int32_t), 16);
+ 
+     ggml_metal_buffer_id bid_src0 = ggml_metal_get_buffer_id(op->src[0]);
+     ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(op);
+diff --git a/ggml/src/ggml-metal/kernels/argsort.metal b/ggml/src/ggml-metal/kernels/argsort.metal
+index 7435938..b402faa 100644
+--- a/ggml/src/ggml-metal/kernels/argsort.metal
++++ b/ggml/src/ggml-metal/kernels/argsort.metal
+@@ -81,6 +81,79 @@ kernel void kernel_argsort_f32_i32(
+ template [[host_name("kernel_argsort_f32_i32_asc")]]  kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_ASC>;
+ template [[host_name("kernel_argsort_f32_i32_desc")]] kernel argsort_t kernel_argsort_f32_i32<GGML_SORT_ORDER_DESC>;
+ 
++template<ggml_sort_order order>
++kernel void kernel_argsort_reg_f32_i32(
++        constant   ggml_metal_kargs_argsort & args,
++        device   const char * src0,
++        device      int32_t * dst,
++        threadgroup int32_t * shmem_i32 [[threadgroup(0)]],
++        uint3   tgpig[[threadgroup_position_in_grid]],
++        ushort3 tpitg[[thread_position_in_threadgroup]],
++        ushort3   ntg[[threads_per_threadgroup]]) {
++    const int col = tpitg[0];
++    const int ib  = tgpig[0] / args.ne01;
++
++    const int i00 = ib*ntg.x;
++    const int i01 = tgpig[0] % args.ne01;
++    const int i02 = tgpig[1];
++    const int i03 = tgpig[2];
++
++    device const float * src0_row = (device const float *) (src0 + args.nb01*i01 + args.nb02*i02 + args.nb03*i03);
++
++    threadgroup float * shmem_f32 = (threadgroup float *) (shmem_i32 + ntg.x);
++
++    int   idx = i00 + col;
++    float val = idx < args.ne00 ? src0_row[idx] : 0.0f;
++
++    for (int k = 2; k <= (int) ntg.x; k *= 2) {
++        for (int j = k / 2; j > 0; j /= 2) {
++            const int ixj = col ^ j;
++            int   pidx;
++            float pval;
++            if (j >= 32) {
++                shmem_i32[col] = idx;
++                shmem_f32[col] = val;
++                threadgroup_barrier(mem_flags::mem_threadgroup);
++                pidx = shmem_i32[ixj];
++                pval = shmem_f32[ixj];
++                threadgroup_barrier(mem_flags::mem_threadgroup);
++            } else {
++                pidx = simd_shuffle_xor(idx, (ushort) j);
++                pval = simd_shuffle_xor(val, (ushort) j);
++            }
++            // the original decides on the lower element of the pair; both threads evaluate the same decision
++            const bool  is_lo = ixj > col;
++            const int   lo_i  = is_lo ? idx  : pidx;
++            const int   hi_i  = is_lo ? pidx : idx;
++            const float lo_v  = is_lo ? val  : pval;
++            const float hi_v  = is_lo ? pval : val;
++            bool sw;
++            if ((col & k) == 0) {
++                sw = lo_i >= args.ne00 ||
++                    (hi_i <  args.ne00 && (order == GGML_SORT_ORDER_ASC ? lo_v > hi_v : lo_v < hi_v));
++            } else {
++                sw = hi_i >= args.ne00 ||
++                    (lo_i <  args.ne00 && (order == GGML_SORT_ORDER_ASC ? lo_v < hi_v : lo_v > hi_v));
++            }
++            if (sw) {
++                idx = pidx;
++                val = pval;
++            }
++        }
++    }
++
++    const int64_t i0 = ib*args.top_k;
++
++    if (i0 + col < args.ne0 && col < args.top_k) {
++        dst += i0 + args.ne0*i01 + args.ne0*args.ne1*i02 + args.ne0*args.ne1*args.ne2*i03;
++
++        dst[col] = idx;
++    }
++}
++
++template [[host_name("kernel_argsort_reg_f32_i32_asc")]]  kernel argsort_t kernel_argsort_reg_f32_i32<GGML_SORT_ORDER_ASC>;
++template [[host_name("kernel_argsort_reg_f32_i32_desc")]] kernel argsort_t kernel_argsort_reg_f32_i32<GGML_SORT_ORDER_DESC>;
++
+ typedef void (argsort_merge_t)(
+         constant   ggml_metal_kargs_argsort_merge & args,
+         device const char    * src0,
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 3d84be0..3fcbe5f 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -880,6 +880,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+     zeros = ggml_repeat_4d(ctx0, zeros, n_sel, n_tokens, 1, 1);
+     zeros = ggml_reshape_3d(ctx0, zeros, 1, n_sel, n_tokens);
+ 
++    static const bool simple_mask = !getenv("LLAMA_QSA_SIMPLE_MASK") || atoi(getenv("LLAMA_QSA_SIMPLE_MASK")) != 0;
++    if (simple_mask) {
++        ggml_tensor * sel = ggml_set_rows(ctx0, mask_all, zeros, ggml_reshape_3d(ctx0, sel_idx, n_sel, n_tokens, 1));
++        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1]*kq_mask->ne[2]*kq_mask->ne[3] == n_tokens);
++        const size_t row = sel->nb[2];
++        sel = ggml_view_4d(ctx0, sel, n_kv, kq_mask->ne[1], kq_mask->ne[2], kq_mask->ne[3],
++                row, row*kq_mask->ne[1], row*kq_mask->ne[1]*kq_mask->ne[2], 0);
++        sel = ggml_add(ctx0, sel, kq_mask);
++        cb(sel, "indexer_sel", il);
++        return sel;
++    }
++
+     // live slots address disjoint cells, but padded pools and missing tail cells share the n_kv sentinel, and
+     // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
+     // some cells from several threads: map every dead slot to its own dump row, idx = dump + live*(idx - dump)
+-- 
+2.50.1 (Apple Git-155)
+

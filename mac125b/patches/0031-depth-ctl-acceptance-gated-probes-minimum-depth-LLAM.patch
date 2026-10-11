@@ -1,0 +1,60 @@
+From ab017207c5fa7b3c925af6c32dfcf669df64e67c Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 01:04:41 +0900
+Subject: [PATCH 31/49] depth ctl: acceptance-gated probes, minimum depth
+ (LLAMA_SPEC_DEPTH_MIN, default 3)
+
+---
+ common/speculative.cpp | 17 ++++++++++++-----
+ 1 file changed, 12 insertions(+), 5 deletions(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 02b0247..099ea2b 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1488,6 +1488,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         float rate[17];                 // tokens per ms observed at depth d (0 = unknown)
+         int   last_acc = -1;            // accepted count of the previous round
+         int   probe_dir = 1;
++        int   dmin = 3;                 // never draft shallower than this (LLAMA_SPEC_DEPTH_MIN)
+         int64_t t_prev_us = 0;
+         uint64_t rounds = 0;
+ 
+@@ -1495,6 +1496,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             const char * e = getenv("LLAMA_SPEC_DEPTH_CTL");
+             enabled = e && atoi(e) != 0;
+             mode = e ? atoi(e) : 1;
++            if (const char * m = getenv("LLAMA_SPEC_DEPTH_MIN")) dmin = std::max(1, atoi(m));
++            dmin = std::min(dmin, cap);
+             for (int k = 0; k <= 16; ++k) rate[k] = 0.0f;
+             cap = std::min(16, std::max(1, n_max));
+             depth = std::min(cap, 3);
+@@ -1865,16 +1868,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (dctl.mode == 2) {
+                 // bandit: measured rate, model prior for unvisited depths
+                 auto R = [&](int dd) { return dctl.rate[dd] > 0.0f ? dctl.rate[dd] : dctl.E(dd)/dctl.T(dd); };
+-                int bd = dctl.depth;
+-                for (int dd = 1; dd <= dctl.cap; ++dd) {
++                int bd = std::max(dctl.depth, dctl.dmin);
++                for (int dd = dctl.dmin; dd <= dctl.cap; ++dd) {
+                     if (R(dd) > 1.03f*R(bd)) bd = dd;
+                 }
+                 dctl.depth = bd;
+                 int use = bd;
++                // probe a neighbour only where the acceptance of the last drafted position says it may pay:
++                // deeper when that position is usually accepted, shallower when it usually fails
+                 if (++dctl.rounds_at % 8 == 0) {
+-                    const int nb = bd + dctl.probe_dir;
+-                    dctl.probe_dir = -dctl.probe_dir;
+-                    if (nb >= 1 && nb <= dctl.cap) use = nb;
++                    if (dctl.a[bd] >= 0.75f && bd < dctl.cap) {
++                        use = bd + 1;
++                    } else if (dctl.a[bd] <= 0.40f && bd > dctl.dmin) {
++                        use = bd - 1;
++                    }
+                 }
+                 mtp_depth = use;
+                 if (getenv("LLAMA_SPEC_DEPTH_LOG") && dctl.rounds_at % 25 == 0) {
+-- 
+2.50.1 (Apple Git-155)
+

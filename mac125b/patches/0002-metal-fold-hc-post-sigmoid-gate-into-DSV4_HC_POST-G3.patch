@@ -1,0 +1,217 @@
+From c26719a3019881ed17ac93af711631c57c854b95 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 21:32:09 +0900
+Subject: [PATCH 02/49] metal: fold hc post sigmoid gate into DSV4_HC_POST (G3)
+
+---
+ ggml/src/ggml-metal/ggml-metal-fusion.cpp | 54 +++++++++++++++++++
+ ggml/src/ggml-metal/ggml-metal-fusion.h   |  1 +
+ ggml/src/ggml-metal/ggml-metal-impl.h     |  5 ++
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    | 64 +++++++++++++++++++++++
+ ggml/src/ggml-metal/kernels/misc.metal    |  5 ++
+ 5 files changed, 129 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.cpp b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+index d78ca7c..c651dbe 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.cpp
+@@ -757,6 +757,59 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
+ 
+ static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
+ 
++// hyper-connection post weights: post = s1*sigmoid(s0*inject + b0) + b1, consumed only by
++// DSV4_HC_POST. the gate is evaluated per token by the 4 lanes that load the post weights.
++static bool ggml_metal_fusion_check_hc_post_gate(
++        const ggml_metal_fusion       * fusion,
++        const ggml_tensor * const     * nodes,
++        const ggml_cgraph             * gf,
++        const int                     * node_idxs,
++              int                       idx,
++              ggml_metal_fusion_mode    mode) {
++    GGML_UNUSED(mode);
++
++    const ggml_tensor * s0   = nodes[0];
++    const ggml_tensor * sig  = nodes[1];
++    const ggml_tensor * s1   = nodes[2];
++    const ggml_tensor * post = nodes[3];
++
++    if (ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID) {
++        return false;
++    }
++
++    if (sig->src[0] != s0 || s1->src[0] != sig || post->src[2] != s1 || post->src[3] != nullptr) {
++        return false;
++    }
++
++    // x and residual must come from outside the gate chain
++    for (int s = 0; s < 2; ++s) {
++        if (post->src[s] == s0 || post->src[s] == sig || post->src[s] == s1) {
++            return false;
++        }
++    }
++
++    const ggml_tensor * inject = s0->src[0];
++
++    if (inject->type != GGML_TYPE_F32 || s0->type != GGML_TYPE_F32 ||
++        sig->type    != GGML_TYPE_F32 || s1->type != GGML_TYPE_F32 || post->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    if (!ggml_are_same_shape(inject, s1) || inject->ne[0] != 4 || inject->ne[2] != 1 || inject->ne[3] != 1) {
++        return false;
++    }
++
++    if (post->src[1]->ne[1] != 4) {
++        return false;
++    }
++
++    // the gate intermediates must not be used outside the pattern
++    const int out = node_idxs[idx + 3];
++    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), &out, 1);
++}
++
++static const std::vector<ggml_op> ops_hc_post_gate = { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST };
++
+ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
+     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
+@@ -785,6 +838,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
++    { GGML_METAL_FUSION_HC_POST_GATE,   ops_hc_post_gate,           {},     true,  ggml_metal_fusion_check_hc_post_gate },
+ };
+ 
+ // ---- alloc deps -----------------------------------------------------------
+diff --git a/ggml/src/ggml-metal/ggml-metal-fusion.h b/ggml/src/ggml-metal/ggml-metal-fusion.h
+index 5d994c2..a859f5f 100644
+--- a/ggml/src/ggml-metal/ggml-metal-fusion.h
++++ b/ggml/src/ggml-metal/ggml-metal-fusion.h
+@@ -43,6 +43,7 @@ typedef enum ggml_metal_fusion_id {
+     GGML_METAL_FUSION_MOE_REDUCE,   // MUL + expert VIEWs + ADD chain (MoE output reduction)
+     GGML_METAL_FUSION_SSM_CONV_SILU, // SSM_CONV + UNARY (silu)
+     GGML_METAL_FUSION_MUL_MAT_ADD,  // MUL_MAT + ADD (residual added in the few-row MMA store)
++    GGML_METAL_FUSION_HC_POST_GATE, // SCALE + UNARY(sigmoid) + SCALE + DSV4_HC_POST (gate computed in the post kernel)
+ } ggml_metal_fusion_id;
+ 
+ struct ggml_metal_fusion; // defined in ggml-metal-fusion.cpp
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index e7c8956..15bca09 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -1340,6 +1340,11 @@ typedef struct {
+     uint64_t nb_d0;
+     uint64_t nb_d1;
+     uint64_t nb_d2;
++    int32_t  post_gate;  // post = s_out*sigmoid(s_in*post + b_in) + b_out (nocomb only)
++    float    post_s_in;
++    float    post_b_in;
++    float    post_s_out;
++    float    post_b_out;
+ } ggml_metal_kargs_dsv4_hc_post;
+ 
+ typedef struct {
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 86b9fe4..fe48c1c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -814,9 +814,68 @@ int ggml_metal_op_acc(ggml_metal_op_t ctx, int idx) {
+     return 1;
+ }
+ 
++static int ggml_metal_op_hc_post_gate(ggml_metal_op_t ctx, int idx, int n_fuse) {
++    const ggml_tensor * s0     = ctx->node(idx);
++    const ggml_tensor * s1     = ctx->node(idx + 2);
++    const ggml_tensor * op     = ctx->node(idx + n_fuse - 1);
++    const ggml_tensor * inject = s0->src[0];
++    const ggml_tensor * x        = op->src[0];
++    const ggml_tensor * residual = op->src[1];
++
++    GGML_ASSERT(op->op == GGML_OP_DSV4_HC_POST && op->src[3] == nullptr);
++
++    ggml_metal_encoder_t enc = ctx->enc;
++    ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_dsv4_hc(ctx->lib, op));
++
++    ggml_metal_kargs_dsv4_hc_post args = {
++        /*.n_embd   =*/ (int32_t) x->ne[0],
++        /*.n_tokens =*/ (int32_t) x->ne[1],
++        /*.nb_x0    =*/ x->nb[0],
++        /*.nb_x1    =*/ x->nb[1],
++        /*.nb_r0    =*/ residual->nb[0],
++        /*.nb_r1    =*/ residual->nb[1],
++        /*.nb_r2    =*/ residual->nb[2],
++        /*.nb_p0    =*/ inject->nb[0],
++        /*.nb_p1    =*/ inject->nb[1],
++        /*.nb_c0    =*/ 0,
++        /*.nb_c1    =*/ 0,
++        /*.nb_c2    =*/ 0,
++        /*.nb_d0    =*/ op->nb[0],
++        /*.nb_d1    =*/ op->nb[1],
++        /*.nb_d2    =*/ op->nb[2],
++        /*.post_gate  =*/ 1,
++        /*.post_s_in  =*/ ggml_get_op_params_f32(s0, 0),
++        /*.post_b_in  =*/ ggml_get_op_params_f32(s0, 1),
++        /*.post_s_out =*/ ggml_get_op_params_f32(s1, 0),
++        /*.post_b_out =*/ ggml_get_op_params_f32(s1, 1),
++    };
++
++    ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(x),        1);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(residual), 2);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(inject),   3);
++    ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),       4);
++
++    const int n_tiles = (args.n_embd + 31)/32;
++    const int nsg = std::min(4, n_tiles);
++    ggml_metal_encoder_dispatch_threadgroups(
++            enc, (n_tiles + nsg - 1)/nsg, args.n_tokens, 1, 32, nsg, 1);
++
++    return n_fuse;
++}
++
+ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
++    if (op->op == GGML_OP_SCALE && ctx->use_fusion()) {
++        int n = 1;
++        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
++        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_HC_POST_GATE) {
++            ctx->count_fusions(fusion);
++            return ggml_metal_op_hc_post_gate(ctx, idx, n);
++        }
++    }
++
+     ggml_metal_library_t lib = ctx->lib;
+     ggml_metal_encoder_t enc = ctx->enc;
+ 
+@@ -1534,6 +1593,11 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
+                     /*.nb_d0    =*/ op->nb[0],
+                     /*.nb_d1    =*/ op->nb[1],
+                     /*.nb_d2    =*/ op->nb[2],
++                    /*.post_gate  =*/ 0,
++                    /*.post_s_in  =*/ 0.0f,
++                    /*.post_b_in  =*/ 0.0f,
++                    /*.post_s_out =*/ 0.0f,
++                    /*.post_b_out =*/ 0.0f,
+                 };
+ 
+                 ggml_metal_encoder_set_bytes (enc, &args, sizeof(args), 0);
+diff --git a/ggml/src/ggml-metal/kernels/misc.metal b/ggml/src/ggml-metal/kernels/misc.metal
+index fb27983..71d712f 100644
+--- a/ggml/src/ggml-metal/kernels/misc.metal
++++ b/ggml/src/ggml-metal/kernels/misc.metal
+@@ -694,6 +694,11 @@ kernel void kernel_dsv4_hc_post_nocomb_f32(
+     float post_lane = 0.0f;
+     if (tiisg < hc) {
+         post_lane = *(device const float *) (post + tiisg*args.nb_p0 + it*args.nb_p1);
++        if (args.post_gate) {
++            post_lane = args.post_s_in*post_lane + args.post_b_in;
++            post_lane = 1 / (1 + exp(-post_lane));
++            post_lane = args.post_s_out*post_lane + args.post_b_out;
++        }
+     }
+ 
+     float post_reg[hc];
+-- 
+2.50.1 (Apple Git-155)
+

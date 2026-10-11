@@ -1,0 +1,77 @@
+From f9ba136803ef9717787ccca000feea2ac9c69441 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:48:22 +0900
+Subject: [PATCH 16/49] metal: SSM_CONV for few tokens: one thread per channel
+ in 256-thread groups (was 1-2 thread groups)
+
+---
+ ggml/src/ggml-metal/ggml-metal-ops.cpp |  9 ++++++---
+ ggml/src/ggml-metal/kernels/ssm.metal  | 12 ++++++++++--
+ 2 files changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 6928a2d..0a6441c 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -1837,8 +1837,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+ 
+     const ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(n_fuse > 1 ? ctx->node(idx + n_fuse - 1) : op);
+ 
+-    // Use batched kernel for prefill (ne1 > 1) to reduce threadgroup dispatch overhead
+-    const bool use_batched = (ne1 > 1);
++    // Use batched kernel for prefill to reduce threadgroup dispatch overhead; for a few tokens
++    // (decode, speculative verify) the channel-parallel kernel fills the SIMD lanes far better
++    const bool use_batched = (ne1 > 8);
+ 
+     if (use_batched) {
+         // Determine the smallest power of 2 that's >= ne1, but <= 256
+@@ -1872,7 +1873,9 @@ int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {
+         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+         ggml_metal_encoder_set_buffer(enc, bid_dst, 3);
+ 
+-        ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne1, ne02, 1, 1, 1);
++        // one thread per channel; 1-thread threadgroups leave 31 of 32 SIMD lanes idle
++        const int nth = std::min(256, ne01);
++        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nth - 1)/nth, ne1, ne02, nth, 1, 1);
+     }
+ 
+     if (n_fuse > 1 && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+diff --git a/ggml/src/ggml-metal/kernels/ssm.metal b/ggml/src/ggml-metal/kernels/ssm.metal
+index b21c53b..ab277e7 100644
+--- a/ggml/src/ggml-metal/kernels/ssm.metal
++++ b/ggml/src/ggml-metal/kernels/ssm.metal
+@@ -12,10 +12,14 @@ kernel void kernel_ssm_conv_f32_f32(
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]]) {
+-    const int64_t ir = tgpig.x;
++    const int64_t ir = (int64_t) tgpig.x*ntg.x + tpitg.x;
+     const int64_t i2 = tgpig.y;
+     const int64_t i3 = tgpig.z;
+ 
++    if (ir >= args.ne01) {
++        return;
++    }
++
+     const int64_t nc  = FC_ssm_conv_nc;
+   //const int64_t ncs = args.ne00;
+   //const int64_t nr  = args.ne01;
+@@ -43,10 +47,14 @@ kernel void kernel_ssm_conv_f32_f32_4(
+         uint3 tgpig[[threadgroup_position_in_grid]],
+         uint3 tpitg[[thread_position_in_threadgroup]],
+         uint3   ntg[[threads_per_threadgroup]]) {
+-    const int64_t ir = tgpig.x;
++    const int64_t ir = (int64_t) tgpig.x*ntg.x + tpitg.x;
+     const int64_t i2 = tgpig.y;
+     const int64_t i3 = tgpig.z;
+ 
++    if (ir >= args.ne01) {
++        return;
++    }
++
+     const int64_t nc  = FC_ssm_conv_nc;
+   //const int64_t ncs = args.ne00;
+   //const int64_t nr  = args.ne01;
+-- 
+2.50.1 (Apple Git-155)
+

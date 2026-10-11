@@ -1,0 +1,94 @@
+From 8519c1611c193ee777cc6488fc8600ac17eeee8f Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 15:45:22 +0900
+Subject: [PATCH 38/49] profiling: GGML_SCHED_TIME (host time of CPU splits)
+ and LLAMA_HOST_MARK (decode phase timestamps on the Metal clock)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-backend.cpp | 10 ++++++++++
+ src/llama-context.cpp     | 14 ++++++++++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index ff3f079..51541dd 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1885,10 +1885,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
+         }
+ 
+         if (!sched->callback_eval) {
++            // GGML_SCHED_TIME=1: host time of every non-Metal split (profiling)
++            static const bool sched_time = getenv("GGML_SCHED_TIME") != nullptr;
++            const int64_t t0 = sched_time ? ggml_time_us() : 0;
+             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+             if (ec != GGML_STATUS_SUCCESS) {
+                 return ec;
+             }
++            if (sched_time && strcmp(ggml_backend_name(split_backend), "CPU") == 0) {
++                const struct ggml_tensor * n0 = split->graph.n_nodes > 0 ? split->graph.nodes[0] : NULL;
++                fprintf(stderr, "sched-time: split %d/%d %s nodes %d first %s(%s) src0 %s %lldx%lld %.3f ms\n", split_id, sched->n_splits,
++                        ggml_backend_name(split_backend), split->graph.n_nodes, n0 ? ggml_op_name(n0->op) : "-", n0 ? n0->name : "-",
++                        n0 && n0->src[0] ? ggml_type_name(n0->src[0]->type) : "-", n0 ? (long long) n0->ne[0] : 0LL, n0 ? (long long) n0->ne[1] : 0LL,
++                        (ggml_time_us() - t0)/1000.0);
++            }
+         } else {
+             // similar to ggml_backend_compare_graph_backend
+             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index aa421bb..73847ff 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1413,13 +1413,23 @@ bool llama_context::set_adapter_cvec(
+     return res;
+ }
+ 
++#include <time.h>
++static void llama_host_mark(const char * what, int n) {
++    static const bool on = getenv("LLAMA_HOST_MARK") != nullptr;
++    if (on) {
++        fprintf(stderr, "host-mark: %s n=%d t=%.3f\n", what, n, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e6);
++    }
++}
++
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
++    llama_host_mark("pu-start", (int) ubatch.n_tokens);
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+         return nullptr;
+     }
+ 
++    llama_host_mark("applied", (int) ubatch.n_tokens);
+     auto * res = get_gf_res_prev();
+     auto * gf  = res->get_gf();
+ 
+@@ -1482,7 +1492,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         //const auto t_start_us = ggml_time_us();
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
++        llama_host_mark("graph-ready", (int) ubatch.n_tokens);
+         res->set_inputs(&ubatch);
++        llama_host_mark("inputs-set", (int) ubatch.n_tokens);
+ 
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+@@ -1739,6 +1751,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ }
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
++    llama_host_mark("decode-start", -1);
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -1841,6 +1854,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+ 
+     while (true) {
+         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
++        llama_host_mark("init-batch", -1);
+         if (!mctx) {
+             return -2;
+         }
+-- 
+2.50.1 (Apple Git-155)
+

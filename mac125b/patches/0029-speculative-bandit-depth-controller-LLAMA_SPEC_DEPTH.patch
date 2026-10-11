@@ -1,0 +1,90 @@
+From d0db9d021b238d9099f221afbb6cf9bd17f02c86 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 00:37:49 +0900
+Subject: [PATCH 29/49] speculative: bandit depth controller
+ (LLAMA_SPEC_DEPTH_CTL=2) on measured tokens/ms per depth
+
+---
+ common/speculative.cpp | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index ed05eaa..02b0247 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1484,12 +1484,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         bool exploring = false;
+         float a[17];                    // conditional acceptance of position k given k-1 accepted
+         float t[17];                    // round wall ms at depth d (0 = unknown)
++        int   mode = 1;                 // 1 = model (a, T), 2 = bandit on measured rate
++        float rate[17];                 // tokens per ms observed at depth d (0 = unknown)
++        int   last_acc = -1;            // accepted count of the previous round
++        int   probe_dir = 1;
+         int64_t t_prev_us = 0;
+         uint64_t rounds = 0;
+ 
+         void init(int n_max) {
+             const char * e = getenv("LLAMA_SPEC_DEPTH_CTL");
+             enabled = e && atoi(e) != 0;
++            mode = e ? atoi(e) : 1;
++            for (int k = 0; k <= 16; ++k) rate[k] = 0.0f;
+             cap = std::min(16, std::max(1, n_max));
+             depth = std::min(cap, 3);
+             for (int k = 0; k <= 16; ++k) { a[k] = 0.7f; t[k] = 0.0f; }
+@@ -1847,10 +1853,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 const float prior = dctl.T(dctl.last_depth);
+                 if (ms < 2.0f*prior && ms < 150.0f) {
+                     td = td > 0.0f ? 0.8f*td + 0.2f*ms : ms;
++                    if (dctl.mode == 2 && dctl.last_acc >= 0) {
++                        const float r = (dctl.last_acc + 1)/ms;
++                        float & rd = dctl.rate[dctl.last_depth];
++                        rd = rd > 0.0f ? 0.85f*rd + 0.15f*r : r;
++                    }
+                 }
+             }
+             dctl.t_prev_us = now;
+ 
++            if (dctl.mode == 2) {
++                // bandit: measured rate, model prior for unvisited depths
++                auto R = [&](int dd) { return dctl.rate[dd] > 0.0f ? dctl.rate[dd] : dctl.E(dd)/dctl.T(dd); };
++                int bd = dctl.depth;
++                for (int dd = 1; dd <= dctl.cap; ++dd) {
++                    if (R(dd) > 1.03f*R(bd)) bd = dd;
++                }
++                dctl.depth = bd;
++                int use = bd;
++                if (++dctl.rounds_at % 8 == 0) {
++                    const int nb = bd + dctl.probe_dir;
++                    dctl.probe_dir = -dctl.probe_dir;
++                    if (nb >= 1 && nb <= dctl.cap) use = nb;
++                }
++                mtp_depth = use;
++                if (getenv("LLAMA_SPEC_DEPTH_LOG") && dctl.rounds_at % 25 == 0) {
++                    LOG_INF("%s: bandit depth %d use %d rates(1..6) %.3f %.3f %.3f %.3f %.3f %.3f T(1..6) %.1f %.1f %.1f %.1f %.1f %.1f\n", __func__,
++                            bd, use, R(1), R(2), R(3), R(4), R(5), R(6), dctl.T(1), dctl.T(2), dctl.T(3), dctl.T(4), dctl.T(5), dctl.T(6));
++                }
++            } else {
+             int d = dctl.best();
+             if (d != dctl.depth && dctl.E(d)/dctl.T(d) < 1.03f*dctl.E(dctl.depth)/dctl.T(dctl.depth)) {
+                 d = dctl.depth;   // hysteresis
+@@ -1861,6 +1892,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 dctl.exploring = true;
+             }
+             mtp_depth = dctl.exploring ? dctl.depth + 1 : dctl.depth;
++            }
+             dctl.last_depth = mtp_depth;
+         }
+ 
+@@ -2119,6 +2151,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
++        if (dctl.enabled) {
++            dctl.last_acc = n_accepted;
++        }
+         if (dctl.enabled && dctl.last_depth > 0) {
+             // positions 1..min(depth, n_accepted+1) were tried; the first n_accepted succeeded
+             const int tried = std::min<int>(dctl.last_depth, n_accepted + 1);
+-- 
+2.50.1 (Apple Git-155)
+

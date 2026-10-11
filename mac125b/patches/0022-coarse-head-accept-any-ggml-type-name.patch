@@ -1,0 +1,32 @@
+From ca5bda53cc639abf5dd2d7c66a8890f35fb62215 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 23:49:38 +0900
+Subject: [PATCH 22/49] coarse head: accept any ggml type name
+
+---
+ src/llama-model.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 8b2a8b0..90fdcb5 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2055,9 +2055,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         const char * env = getenv("LLAMA_MTP_COARSE_HEAD");
+         const std::string want = env ? env : "q2_K";
+         ggml_type type = GGML_TYPE_COUNT;
+-        if (want == "q2_K") type = GGML_TYPE_Q2_K;
+-        if (want == "q3_K") type = GGML_TYPE_Q3_K;
+-        if (want == "q4_K") type = GGML_TYPE_Q4_K;
++        for (int i = 0; i < GGML_TYPE_COUNT; ++i) {
++            const char * tn = ggml_type_name((ggml_type) i);
++            if (tn && want == tn && ggml_get_type_traits((ggml_type) i)->from_float_ref) {
++                type = (ggml_type) i;
++            }
++        }
+         if (type != GGML_TYPE_COUNT) {
+             const int64_t t0 = ggml_time_us();
+             output_coarse = llama_requantize_copy(output, type, "output_coarse", pimpl->ctxs_bufs);
+-- 
+2.50.1 (Apple Git-155)
+

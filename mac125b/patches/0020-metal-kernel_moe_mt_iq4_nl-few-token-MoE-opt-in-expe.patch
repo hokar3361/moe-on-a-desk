@@ -1,0 +1,249 @@
+From eea59983f527dd7477924fe13d9d8d914852fbb9 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 23:41:40 +0900
+Subject: [PATCH 20/49] metal: kernel_moe_mt_iq4_nl (few-token MoE, opt-in
+ experiments)
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  12 +++
+ ggml/src/ggml-metal/ggml-metal-device.h   |   1 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp    |  49 +++++++++
+ ggml/src/ggml-metal/kernels/mul_mv.metal  | 123 ++++++++++++++++++++++
+ 4 files changed, 185 insertions(+)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index e7b95b0..652c8a5 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -547,6 +547,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_met
+     return res;
+ }
+ 
++ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_mt(ggml_metal_library_t lib, ggml_type type) {
++    char name[128];
++    snprintf(name, sizeof(name), "kernel_moe_mt_%s", ggml_type_name(type));
++
++    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
++    if (!res.pipeline) {
++        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
++    }
++
++    return res;
++}
++
+ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_grp(ggml_metal_library_t lib, ggml_type type) {
+     char name[128];
+     snprintf(name, sizeof(name), "kernel_mul_mv_id_grp_%s", ggml_type_name(type));
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.h b/ggml/src/ggml-metal/ggml-metal-device.h
+index bcd2041..bb2b159 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.h
++++ b/ggml/src/ggml-metal/ggml-metal-device.h
+@@ -138,6 +138,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_hc_mix_bf16       (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_prof_ids          (ggml_metal_library_t lib);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id_grp     (ggml_metal_library_t lib, enum ggml_type type);
++struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_mt            (ggml_metal_library_t lib, enum ggml_type type);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
+ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index eb7a251..886138e 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2956,6 +2956,18 @@ static bool ggml_metal_moe_dedup() {
+     return v;
+ }
+ 
++// few-token MoE matvec (kernel_moe_mt_*): rows per simdgroup, 0 = not available for this type
++static int ggml_metal_moe_mt_rows(const ggml_tensor * op, int64_t ne20, int64_t ne21) {
++    static const bool en = getenv("GGML_METAL_MOE_MT") == nullptr || atoi(getenv("GGML_METAL_MOE_MT")) != 0;
++    if (!en || ne21 > 8 || ne20*ne21 > 96 || op->src[1]->type != GGML_TYPE_F32) {
++        return 0;
++    }
++    switch (op->src[0]->type) {
++        case GGML_TYPE_IQ4_NL: return 8;
++        default:               return 0;
++    }
++}
++
+ // grouped MoE matvec for a few tokens (GGML_METAL_MOE_GRP=1)
+ static bool ggml_metal_moe_grp_ok(const ggml_tensor * op, int64_t ne20, int64_t ne21) {
+     static const bool en = getenv("GGML_METAL_MOE_GRP") != nullptr && atoi(getenv("GGML_METAL_MOE_GRP")) != 0;
+@@ -3140,6 +3152,43 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+ 
+             ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+         }
++    } else if (const int nr_mt = ggml_metal_moe_mt_rows(op, ne20, ne21)) {
++        auto pipeline = ggml_metal_library_get_pipeline_moe_mt(lib, op->src[0]->type);
++
++        ggml_metal_kargs_mul_mv_id args = {
++            /*.nei0 =*/ ne20,
++            /*.nei1 =*/ ne21,
++            /*.nbi1 =*/ nb21,
++            /*.ne00 =*/ ne00,
++            /*.ne01 =*/ ne01,
++            /*.ne02 =*/ ne02,
++            /*.nb00 =*/ nb00,
++            /*.nb01 =*/ nb01,
++            /*.nb02 =*/ nb02,
++            /*.ne10 =*/ ne10,
++            /*.ne11 =*/ ne11,
++            /*.ne12 =*/ ne12,
++            /*.ne13 =*/ ne13,
++            /*.nb10 =*/ nb10,
++            /*.nb11 =*/ nb11,
++            /*.nb12 =*/ nb12,
++            /*.ne0  =*/ ne0,
++            /*.ne1  =*/ ne1,
++            /*.nb1  =*/ nb1,
++            /*.nr0  =*/ nr_mt,
++            /*.dedup =*/ 0,
++        };
++
++        ggml_metal_encoder_set_pipeline(enc, pipeline);
++        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
++        ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
++        ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
++        ggml_metal_encoder_set_buffer  (enc, bid_dst,  3);
++        ggml_metal_encoder_set_buffer  (enc, bid_src2, 4);
++        ggml_metal_encoder_set_threadgroup_memory_size(enc, 8192, 0);
++
++        const int rows_per_tg = nr_mt*2;
++        ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + rows_per_tg - 1)/rows_per_tg, 1, ne20*ne21, 32, 2, 1);
+     } else if (ggml_metal_moe_grp_ok(op, ne20, ne21)) {
+         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id_grp(lib, op->src[0]->type);
+ 
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 4aa5c28..85a5dd2 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3536,3 +3536,126 @@ template [[host_name("kernel_mul_mv_id_grp_iq2_xxs")]] kernel kernel_mul_mv_id_g
+ template [[host_name("kernel_mul_mv_id_grp_iq2_xs")]]  kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq2_xs,  16, dequantize_iq2_xs>;
+ template [[host_name("kernel_mul_mv_id_grp_iq2_s")]]   kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq2_s,   16, dequantize_iq2_s>;
+ template [[host_name("kernel_mul_mv_id_grp_q2_0")]]    kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_q2_0,    4,  dequantize_q2_0>;
++
++// ---- few-token MoE matvec ----------------------------------------------------------------------
++#define MOE_MT_NSG  2
++#define MOE_MT_TMAX 8
++
++// owner test + list of (token, slot) pairs that selected this threadgroup's expert (pairs <= 96)
++static inline bool moe_mt_pairs(
++        constant ggml_metal_kargs_mul_mv_id & args, device const char * ids, int pz, ushort tiisg,
++        thread int32_t & ex, thread short & nm, thread short * qt, thread short * qs) {
++    const int n_pairs = args.nei0*args.nei1;
++    int32_t e[3];
++    for (short k = 0; k < 3; ++k) {
++        const int p = tiisg + 32*k;
++        e[k] = p < n_pairs ? ((device const int32_t *) (ids + (p/args.nei0)*args.nbi1))[p%args.nei0] : -1;
++    }
++    ex = ((device const int32_t *) (ids + (pz/args.nei0)*args.nbi1))[pz%args.nei0];
++    uint m[3];
++    for (short k = 0; k < 3; ++k) {
++        m[k] = (uint) (uint64_t) simd_ballot(e[k] == ex);
++    }
++    const int w = pz/32, b = pz%32;
++    for (short k = 0; k < 3; ++k) {
++        const uint lower = k < w ? 0xffffffffu : (k == w ? ((1u << b) - 1u) : 0u);
++        if (m[k] & lower) {
++            return false;
++        }
++    }
++    nm = 0;
++    for (short k = 0; k < 3; ++k) {
++        for (uint mm = m[k]; mm != 0 && nm < MOE_MT_TMAX; mm &= mm - 1) {
++            const int q = 32*k + ctz(mm);
++            qt[nm] = q/args.nei0;
++            qs[nm] = q%args.nei0;
++            nm++;
++        }
++    }
++    return true;
++}
++
++// iq4_nl: same lane layout as kernel_mul_mv_iq4_nl_f32_impl (lane pair per 32-block, 8 values per lane)
++template <short NR>
++kernel void kernel_moe_mt_iq4_nl(
++        constant ggml_metal_kargs_mul_mv_id & args,
++        device const char * src0s,
++        device const char * src1,
++        device       char * dst,
++        device const char * ids,
++        threadgroup  char * shmem [[threadgroup(0)]],
++        uint3  tgpig[[threadgroup_position_in_grid]],
++        ushort tiisg[[thread_index_in_simdgroup]],
++        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
++    threadgroup float * kv = (threadgroup float *) shmem;
++    if (sgitg == 0) {
++        kv[tiisg] = kvalues_iq4nl_f[tiisg%16];
++    }
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++
++    int32_t ex; short nm; short qt[MOE_MT_TMAX]; short qs[MOE_MT_TMAX];
++    if (!moe_mt_pairs(args, ids, tgpig.z, tiisg, ex, nm, qt, qs)) {
++        return;
++    }
++
++    const int first_row = (tgpig.x*MOE_MT_NSG + sgitg)*NR;
++    const int nb   = args.ne00/QK4_NL;
++    const int ns01 = args.nb01/args.nb00;
++
++    device const block_iq4_nl * x = (device const block_iq4_nl *) (src0s + ex*args.nb02 + first_row*args.nb01);
++
++    const short ix = tiisg/2;
++    const short it = tiisg%2;
++
++    uint32_t aux32[2];
++    thread const uint8_t * q8 = (thread const uint8_t *) aux32;
++
++    // token-major: activations of one (token, slot) loaded once per block, rows inside; the
++    // expert's row tile stays in cache across the tokens of this threadgroup
++    for (short t = 0; t < nm; ++t) {
++        device const float * yb = (device const float *) (src1 + (qs[t] % args.ne11)*args.nb11 + qt[t]*args.nb12) + ix*QK4_NL + it*8;
++
++        float sumf[NR];
++        for (short r = 0; r < NR; ++r) {
++            sumf[r] = 0.0f;
++        }
++
++        for (int ib = ix; ib < nb; ib += 16) {
++            device const float4 * y4 = (device const float4 *) yb;
++            const float4 yl0 = y4[0], yl1 = y4[4], yl2 = y4[1], yl3 = y4[5];
++
++            for (short row = 0; row < NR; ++row) {
++                device const block_iq4_nl & xb = x[row*ns01 + ib];
++                device const uint16_t * q4 = (device const uint16_t *) (xb.qs + 8*it);
++
++                float4 acc1 = 0.0f, acc2 = 0.0f;
++                aux32[0] = q4[0] | (q4[1] << 16);
++                aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
++                aux32[0] &= 0x0f0f0f0f;
++                acc1 += yl0 * float4(kv[q8[0]], kv[q8[1]], kv[q8[2]], kv[q8[3]]);
++                acc2 += yl1 * float4(kv[q8[4]], kv[q8[5]], kv[q8[6]], kv[q8[7]]);
++                aux32[0] = q4[2] | (q4[3] << 16);
++                aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0f;
++                aux32[0] &= 0x0f0f0f0f;
++                acc1 += yl2 * float4(kv[q8[0]], kv[q8[1]], kv[q8[2]], kv[q8[3]]);
++                acc2 += yl3 * float4(kv[q8[4]], kv[q8[5]], kv[q8[6]], kv[q8[7]]);
++                acc1 += acc2;
++                sumf[row] += (float) xb.d * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
++            }
++
++            yb += 16*QK4_NL;
++        }
++
++        device float * d = (device float *) (dst + (qs[t]*args.ne0 + qt[t]*args.ne1*args.ne0)*sizeof(float));
++        for (short row = 0; row < NR; ++row) {
++            const float sa = simd_sum(sumf[row]);
++            if (tiisg == 0 && first_row + row < args.ne01) {
++                d[first_row + row] = sa;
++            }
++        }
++    }
++}
++
++typedef decltype(kernel_moe_mt_iq4_nl<8>) kernel_moe_mt_t;
++
++template [[host_name("kernel_moe_mt_iq4_nl")]] kernel kernel_moe_mt_t kernel_moe_mt_iq4_nl<8>;
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,0 +1,141 @@
+From b2b628c08e38da31cd40ce2315140d53a631c06b Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sat, 10 Oct 2026 22:35:00 +0900
+Subject: [PATCH 12/49] metal: MoE expert dedup for multi-token mul_mv_id
+ (ballot owner test)
+
+---
+ ggml/src/ggml-metal/ggml-metal-impl.h    |  1 +
+ ggml/src/ggml-metal/ggml-metal-ops.cpp   |  7 +++
+ ggml/src/ggml-metal/kernels/mul_mv.metal | 64 ++++++++++++++++--------
+ 3 files changed, 52 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-impl.h b/ggml/src/ggml-metal/ggml-metal-impl.h
+index 571b97f..76d33d8 100644
+--- a/ggml/src/ggml-metal/ggml-metal-impl.h
++++ b/ggml/src/ggml-metal/ggml-metal-impl.h
+@@ -618,6 +618,7 @@ typedef struct {
+     int32_t  ne1;
+     uint64_t nb1;
+     int32_t  nr0;
++    int32_t  dedup;   // multi-token: one threadgroup per distinct expert
+ } ggml_metal_kargs_mul_mv_id;
+ 
+ // NORM
+diff --git a/ggml/src/ggml-metal/ggml-metal-ops.cpp b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+index 9368e10..3729bac 100644
+--- a/ggml/src/ggml-metal/ggml-metal-ops.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-ops.cpp
+@@ -2887,6 +2887,12 @@ size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
+     return 8 + N_MM_NPART_AMAX*sizeof(float);
+ }
+ 
++// GGML_METAL_MOE_DEDUP=0 disables reading each selected expert once per batch
++static bool ggml_metal_moe_dedup() {
++    static const bool v = getenv("GGML_METAL_MOE_DEDUP") == nullptr || atoi(getenv("GGML_METAL_MOE_DEDUP")) != 0;
++    return v;
++}
++
+ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+     ggml_tensor * op = ctx->node(idx);
+ 
+@@ -3101,6 +3107,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
+             /*.ne1  =*/ ne1,
+             /*.nb1  =*/ nb1,
+             /*.nr0  =*/ nr0,
++            /*.dedup =*/ (ne21 > 1 && ne20*ne21 <= 64 && ggml_metal_moe_dedup()) ? 1 : 0,
+         };
+ 
+         if (ggml_is_quantized(op->src[0]->type)) {
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 0d1069f..cf3a2ac 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -3303,23 +3303,32 @@ kernel void kernel_mul_mv_id(
+         ushort tiitg[[thread_index_in_threadgroup]],
+         ushort tiisg[[thread_index_in_simdgroup]],
+         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+-    const int iid1 = tgpig.z/args.nei0;
+-    const int idx  = tgpig.z%args.nei0;
++    const int pz   = tgpig.z;
++    const int iid1 = pz/args.nei0;
++    const int idx  = pz%args.nei0;
+ 
+     tgpig.z = 0;
+ 
+     const int32_t i02 = ((device const int32_t *) (ids + iid1*args.nbi1))[idx];
+ 
+-    const int64_t i11 = idx % args.ne11;
+-    const int64_t i12 = iid1;
+-
+-    const int64_t i1 = idx;
+-    const int64_t i2 = i12;
++    // dedup: only the first pair selecting this expert runs; it then covers all later pairs
++    // (pairs are loaded two per lane; n_pairs <= 64 is guaranteed by the host)
++    uint64_t match = 0;
++    if (args.dedup) {
++        const int n_pairs = args.nei0*args.nei1;
++        const int pa = tiisg, pb = tiisg + 32;
++        const int32_t ea = pa < n_pairs ? ((device const int32_t *) (ids + (pa/args.nei0)*args.nbi1))[pa%args.nei0] : -1;
++        const int32_t eb = pb < n_pairs ? ((device const int32_t *) (ids + (pb/args.nei0)*args.nbi1))[pb%args.nei0] : -1;
++        const uint64_t ma = (uint64_t) simd_ballot(ea == i02);
++        const uint64_t mb = (uint64_t) simd_ballot(eb == i02);
++        match = (ma & 0xffffffffull) | ((mb & 0xffffffffull) << 32);
++        // earlier pair with the same expert -> not the owner
++        if (match & ((1ull << pz) - 1ull)) {
++            return;
++        }
++    }
+ 
+     device const char * src0_cur = src0s + i02*args.nb02;
+-    device const char * src1_cur = src1  + i11*args.nb11 + i12*args.nb12;
+-
+-    device char * dst_cur = dst + (i1*args.ne0 + i2*args.ne1*args.ne0)*sizeof(float);
+ 
+     ggml_metal_kargs_mul_mv args0 = {
+         /*.ne00 =*/ args.ne00,
+@@ -3343,16 +3352,31 @@ kernel void kernel_mul_mv_id(
+         /*.r3   =*/ 1,
+     };
+ 
+-    disp_fn(
+-        args0,
+-        /* src0 */ src0_cur,
+-        /* src1 */ src1_cur,
+-        /* dst  */ dst_cur,
+-        shmem,
+-        tgpig,
+-        tiitg,
+-        tiisg,
+-        sgitg);
++    if (!args.dedup) {
++        match = 1ull << pz;
++    }
++    for (uint64_t m = match; m != 0; m &= m - 1) {
++        const int q  = ctz(m);
++        const int qt = q/args.nei0;
++        const int qs = q%args.nei0;
++
++        const int64_t i11 = qs % args.ne11;
++        const int64_t i12 = qt;
++
++        device const char * src1_cur = src1 + i11*args.nb11 + i12*args.nb12;
++        device       char * dst_cur  = dst  + (qs*args.ne0 + i12*args.ne1*args.ne0)*sizeof(float);
++
++        disp_fn(
++            args0,
++            /* src0 */ src0_cur,
++            /* src1 */ src1_cur,
++            /* dst  */ dst_cur,
++            shmem,
++            tgpig,
++            tiitg,
++            tiisg,
++            sgitg);
++    }
+ }
+ 
+ typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;
+-- 
+2.50.1 (Apple Git-155)
+

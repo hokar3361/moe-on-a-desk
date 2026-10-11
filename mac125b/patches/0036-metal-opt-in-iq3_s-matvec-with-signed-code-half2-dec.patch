@@ -1,0 +1,164 @@
+From 057eb80f9704f1d455c7dd2d090e53d9da552cf3 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 14:39:28 +0900
+Subject: [PATCH 36/49] metal: opt-in iq3_s matvec with signed-code half2
+ decode and 16 live activations (GGML_METAL_IQ3S_MAGIC; -13% at B=4 in
+ isolation, changes summation order)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  4 +-
+ ggml/src/ggml-metal/ggml-metal-device.m   |  5 ++
+ ggml/src/ggml-metal/kernels/mul_mv.metal  | 80 +++++++++++++++++++++++
+ 3 files changed, 87 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 71157d7..832f947 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1188,7 +1188,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
+             {
+                 nsg = N_SG_IQ3_S;
+                 nr0 = N_R0_IQ3_S;
+-                smem = 512*4;
++                smem = 512*4 + 64; // + sign masks (GGML_METAL_IQ3S_MAGIC)
+ 
+                 const int nb32 = ne00/32;
+                 if (nb32 < 32 && (32 % nb32) == 0) {
+@@ -1507,7 +1507,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             {
+                 nsg = N_SG_IQ3_S;
+                 nr0 = N_R0_IQ3_S;
+-                smem = 512*4;
++                smem = 512*4 + 64; // + sign masks (GGML_METAL_IQ3S_MAGIC)
+ 
+                 const int nb32 = ne00/32;
+                 if (nb32 < 32 && (32 % nb32) == 0) {
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index bf10130..d3cf8ff 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -462,6 +462,11 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
+     }
+ #if GGML_METAL_EMBED_LIBRARY
+     [prep setObject:@"1" forKey:@"GGML_METAL_EMBED_LIBRARY"];
++    // iq3_s matvec (opt-in): signed-code half2 decode with 16 live activations (2); 1 = decode only; 0 = original (default: output identical to the baseline)
++    {
++        const char * e = getenv("GGML_METAL_IQ3S_MAGIC");
++        [prep setObject:@(e ? e : "0") forKey:@"GGML_METAL_IQ3S_MAGIC"];
++    }
+     if (getenv("GGML_METAL_PROF_NOIDS")) {
+         [prep setObject:@"1" forKey:@"GGML_METAL_PROF_NOIDS"];
+     }
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 97bf020..3295550 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -1,4 +1,7 @@
+ #include "common.h"
++#ifndef GGML_METAL_IQ3S_MAGIC
++#define GGML_METAL_IQ3S_MAGIC 0
++#endif
+ #ifndef GGML_METAL_PROF_NOIDS
+ #define GGML_METAL_PROF_NOIDS 0
+ #endif
+@@ -2339,12 +2342,64 @@ void kernel_mul_mv_iq3_s_f32_impl(
+         int nval = 8;
+         int pos  = (32*sgitg + tiisg)*nval;
+         for (int i = 0; i < GGML_PROF_NVAL(nval); ++i) svalues[pos + i] = iq3s_grid[pos + i];
++#if GGML_METAL_IQ3S_MAGIC
++        // per-byte sign masks of 4 sign bits
++        if (sgitg == 0 && tiisg < 16) {
++            const uint b = tiisg;
++            svalues[512 + b] = ((b & 1) ? 0x000000ffu : 0u) | ((b & 2) ? 0x0000ff00u : 0u) | ((b & 4) ? 0x00ff0000u : 0u) | ((b & 8) ? 0xff000000u : 0u);
++        }
++#endif
+         threadgroup_barrier(mem_flags::mem_threadgroup);
+     }
+ 
+     device const float * y4 = y + 32 * ix;
+ 
+     for (int ib32 = ix; ib32 < nb32; ib32 += ntx) {
++#if GGML_METAL_IQ3S_MAGIC >= 2
++        {
++            const int ibl = ib32 / (QK_K / 32);
++            const int ib  = ib32 % (QK_K / 32);
++            const short NH = GGML_METAL_IQ3S_MAGIC == 3 ? 4 : 2;
++            for (short hh = 0; hh < NH; ++hh) {
++                const short HW = 32/NH;
++                float yh[16];
++                for (short i = 0; i < HW; ++i) yh[i] = y4[HW*hh + i];
++                device const block_iq3_s * xr = x + ibl;
++                device const uint8_t * qs = xr->qs + 8 * ib + (8/NH)*hh;
++                device const uint8_t * qh = xr->qh + ib;
++                device const uint8_t * sc = xr->scales + (ib/2);
++                device const uint8_t * signs = xr->signs + 4 * ib + (4/NH)*hh;
++                device const half * dh = &xr->d;
++                for (short row = row0; row < row1; row++) {
++                    const float d = (float) dh[0] * (1 + 2*((sc[0] >> 4*(ib%2)) & 0xf));
++                    const uint qhb = qh[0];
++                    float acc = 0.0f;
++                    for (short l2 = 0; l2 < 4/NH; ++l2) {
++                        const short l = (4/NH)*hh + l2;
++                        const uint g1 = svalues[qs[2*l2+0] | ((qhb << (8 - 2*l)) & 256)];
++                        const uint g2 = svalues[qs[2*l2+1] | ((qhb << (7 - 2*l)) & 256)];
++                        const uint sg = signs[l2];
++                        const uint m1 = svalues[512 + (sg & 15)];
++                        const uint m2 = svalues[512 + (sg >> 4)];
++                        const uint c1 = (g1 ^ (m1 & 0x0f0f0f0fu)) + (m1 & 0x01010101u) + (~m1 & 0x10101010u);
++                        const uint c2 = (g2 ^ (m2 & 0x0f0f0f0fu)) + (m2 & 0x01010101u) + (~m2 & 0x10101010u);
++                        const half2 a1 = as_type<half2>((c1 & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                        const half2 b1 = as_type<half2>(((c1 >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                        const half2 a2 = as_type<half2>((c2 & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                        const half2 b2 = as_type<half2>(((c2 >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                        acc = fma(yh[8*l2 + 0], (float) a1[0], acc); acc = fma(yh[8*l2 + 1], (float) b1[0], acc);
++                        acc = fma(yh[8*l2 + 2], (float) a1[1], acc); acc = fma(yh[8*l2 + 3], (float) b1[1], acc);
++                        acc = fma(yh[8*l2 + 4], (float) a2[0], acc); acc = fma(yh[8*l2 + 5], (float) b2[0], acc);
++                        acc = fma(yh[8*l2 + 6], (float) a2[1], acc); acc = fma(yh[8*l2 + 7], (float) b2[1], acc);
++                    }
++                    sumf[row] += d * acc;
++                    dh += args.nb01/2; qs += args.nb01; qh += args.nb01; sc += args.nb01; signs += args.nb01;
++                }
++            }
++            y4 += 32 * ntx;
++            continue;
++        }
++#endif
+         for (short i = 0; i < 32; ++i) {
+             yl[i] = y4[i];
+         }
+@@ -2364,6 +2419,31 @@ void kernel_mul_mv_iq3_s_f32_impl(
+             const float d = db * (1 + 2*((sc[0] >> 4*(ib%2)) & 0xf));
+ 
+             float2 sum = {0};
++#if GGML_METAL_IQ3S_MAGIC
++            {
++                const uint qhb = qh[0];
++                float acc = 0.0f;
++                for (short l = 0; l < 4; ++l) {
++                    const uint g1 = svalues[qs[2*l+0] | ((qhb << (8 - 2*l)) & 256)];
++                    const uint g2 = svalues[qs[2*l+1] | ((qhb << (7 - 2*l)) & 256)];
++                    const uint sg = signs[l];
++                    const uint m1 = svalues[512 + (sg & 15)];
++                    const uint m2 = svalues[512 + (sg >> 4)];
++                    const uint c1 = (g1 ^ (m1 & 0x0f0f0f0fu)) + (m1 & 0x01010101u) + (~m1 & 0x10101010u);
++                    const uint c2 = (g2 ^ (m2 & 0x0f0f0f0fu)) + (m2 & 0x01010101u) + (~m2 & 0x10101010u);
++                    const half2 a1 = as_type<half2>((c1 & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                    const half2 b1 = as_type<half2>(((c1 >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                    const half2 a2 = as_type<half2>((c2 & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                    const half2 b2 = as_type<half2>(((c2 >> 8) & 0x00ff00ffu) | 0x64006400u) - half2(1040.0h);
++                    acc = fma(yl[8*l + 0], (float) a1[0], acc); acc = fma(yl[8*l + 1], (float) b1[0], acc);
++                    acc = fma(yl[8*l + 2], (float) a1[1], acc); acc = fma(yl[8*l + 3], (float) b1[1], acc);
++                    acc = fma(yl[8*l + 4], (float) a2[0], acc); acc = fma(yl[8*l + 5], (float) b2[0], acc);
++                    acc = fma(yl[8*l + 6], (float) a2[1], acc); acc = fma(yl[8*l + 7], (float) b2[1], acc);
++                }
++                sum[0] = acc;
++            }
++            if (false)
++#endif
+             for (short l = 0; l < 4; ++l) {
+                 const threadgroup uint32_t * table1 = qh[0] & kmask_iq2xs[2*l+0] ? svalues + 256 : svalues;
+                 const threadgroup uint32_t * table2 = qh[0] & kmask_iq2xs[2*l+1] ? svalues + 256 : svalues;
+-- 
+2.50.1 (Apple Git-155)
+
