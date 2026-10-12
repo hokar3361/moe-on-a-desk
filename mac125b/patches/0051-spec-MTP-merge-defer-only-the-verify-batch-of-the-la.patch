@@ -1,0 +1,82 @@
+From 12ea6b4b1d6d8f515f708ae461e0392894e2fe43 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Mon, 12 Oct 2026 09:03:11 +0900
+Subject: [PATCH 51/51] spec MTP merge: defer only the verify batch of the last
+ draft; drop stale deferred catch-up on any other batch (new prompt), never
+ flush rows that do not continue the draft context (fixes inconsistent
+ sequence positions with prompt-cache reuse)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/speculative.cpp | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 73d9708..6d0ada7 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1492,6 +1492,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<std::vector<llama_pos>> def_pos;
+     std::vector<std::vector<float>>     def_h0;     // pending_h at process() time, pairs with def_tok[0]
+     std::vector<int32_t>                def_nacc;
++    std::vector<llama_pos>              def_pos0;   // pos0 of the last draft(): its verify batch starts there
+ 
+     // run a deferred catch-up on its own (accepted prefix)
+     void mtp_flush(llama_seq_id s) {
+@@ -1500,6 +1501,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (n <= 0) {
+             return;
+         }
++        if (def_pos[s][0] > llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), s) + 1) {
++            return;
++        }
+         batch.clear();
+         for (int k = 0; k < n; ++k) {
+             const int32_t idx = batch.add(def_tok[s][k], def_pos[s][k], s, false);
+@@ -1921,6 +1925,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         def_pos.assign(n_seq, {});
+         def_h0.assign(n_seq, {});
+         def_nacc.assign(n_seq, 0);
++        def_pos0.assign(n_seq, -1);
+         if (merge) {
+             LOG_INF("%s: MTP catch-up merged into the first draft step\n", __func__);
+         }
+@@ -2008,12 +2013,27 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+         // merged catch-up: during generation stash the verify batch, the catch-up runs in the next draft()
+         bool deferred = false;
++        if (merge) {
++            // a batch that is not a small single-sequence token batch ends the generation phase of its sequences
++            const bool small = batch_in.has_token() && !batch_in.has_embd() && n_tokens <= 16;
++            for (int k = 0; k < n_tokens && !small; ++k) {
++                const llama_seq_id sk = batch_in.tokens[k].seq_id;
++                if (sk >= 0 && sk < (llama_seq_id) n_seq) {
++                    gen[sk]       = false;
++                    def_valid[sk] = false;
++                }
++            }
++        }
+         if (merge && batch_in.has_token() && !batch_in.has_embd() && n_tokens <= 16) {
+             const llama_seq_id s0 = batch_in.tokens[0].seq_id;
+             bool one_seq = s0 >= 0 && s0 < (llama_seq_id) n_seq;
+             for (int k = 0; k < n_tokens && one_seq; ++k) {
+                 one_seq = batch_in.tokens[k].seq_id == s0 && batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
+             }
++            if (one_seq && gen[s0] && batch_in.tokens[0].pos[0] != def_pos0[s0]) {
++                gen[s0]       = false;   // not the verify batch of the last draft (e.g. a new prompt)
++                def_valid[s0] = false;
++            }
+             if (one_seq && gen[s0]) {
+                 if (def_valid[s0]) {
+                     mtp_flush(s0);
+@@ -2297,6 +2317,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 }
+             }
+ 
++            def_pos0[seq_id] = dp.pos0;
+             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
+             batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
+ 
+-- 
+2.50.1 (Apple Git-155)
+

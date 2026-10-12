@@ -51,9 +51,13 @@ fixed prompt each. The two comparison rows were measured once on the same machin
 | this work `mac125b-best-2026-10-11` | IQ3_XXS + MTP Q8_0 | 94.8 | 93.2 | 99.9 | 60.7 |
 | this work `-11d` (mean of 2 runs) | same | 98.4 | 98.8 | 107.0 | 65.9 |
 | this work `-11e` (mean of 2 runs) | same | 115.8 | 106.6 | 111.2 | 69.7 |
-| **this work `-11f`** (mean of 2 runs) | same | **125.8** | **109.7** | **110.3** | **70.9** |
+| this work `-11f` (mean of 2 runs) | same | 125.8 | 109.7 | 110.3 | 70.9 |
+| **this work `-12a`** (mean of 3 runs) | same | **124.7** | **117.9** | **112.4** | **66.8** |
 
-`-11f` is +64 / +46 / +44 / +47 % over the start. The other engines are listed as reference points on the same machine,
+`-12a` is +62 / +57 / +47 / +38 % over the start. It fixes a draft-context bug with prompt-cache reuse
+([issue #1](https://github.com/hokar3361/moe-on-a-desk/issues/1)); bench 4K, which repeats its prompts, gains the most.
+Measured side by side in one session, `-11f` gave 126.2 / 109.9 / 116.5 / 68.3: code produced the same text, and
+code / prose single runs swing by ±10 % (the prose text itself varies between runs of the same build, see below). The other engines are listed as reference points on the same machine,
 not as a ranking: each makes different trade-offs (quantization, memory footprint, features), and we learned a lot from them. On 18 held-out prompts (code, poems, reviews; never used for tuning):
 start 60.2 → `-11d` 74.5 tok/s; `-11e` +6.3 % over `-11d`, `-11f` +2.2 % over `-11e`. For context, TensorFold 0.6.6
 runs the model's MLX 4-bit build on the same Mac by streaming experts from SSD — a capability for models larger than memory
@@ -153,6 +157,10 @@ Verify before trusting a build:
 - **Fixed bug.** Checkpoints `-11b` to `-11e` contain a fusion that corrupts prompt batches of ≥ 64 tokens when
   `GGML_ALLOC_FREE_DELAY` is not set (PPL 1.23 → 253 at ubatch 512). Every configuration measured here sets it, so the
   numbers stand, but use `-11f` or later.
+- **Fixed bug ([issue #1](https://github.com/hokar3361/moe-on-a-desk/issues/1)).** Up to `-11f`, `LLAMA_SPEC_MTP_MERGE=1`
+  could flush the deferred MTP catch-up of the previous request into the draft context when a new request reused a cached
+  prompt prefix, so the first draft of each such request failed (`inconsistent sequence positions`, `deferred catch-up
+  failed`). The target output is not affected (drafts are always verified), only speed. Fixed in `-12a` (patch 0051).
 - **Comparisons.** The engines use different quantizations (Sushi: its own 2.6 bpw expert format; TensorFold: MLX 4-bit),
   so the numbers are reference points, not a like-for-like ranking. Thinking is off for every engine. The stop rule was fitted on 48 separate training
   prompts; the fixed-metric prompts and the held-out set were never used for fitting.

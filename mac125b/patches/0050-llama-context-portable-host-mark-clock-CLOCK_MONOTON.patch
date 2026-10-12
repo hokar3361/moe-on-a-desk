@@ -1,0 +1,42 @@
+From 73ca336d30605b73c9f90b6fe9737954832a49c9 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Sun, 11 Oct 2026 21:22:52 +0900
+Subject: [PATCH 50/51] llama-context: portable host-mark clock
+ (CLOCK_MONOTONIC off Apple)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 73847ff..97c8ffa 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -21,6 +21,14 @@
+ #include <stdexcept>
+ #include <string>
+ #include <unordered_map>
++#include <time.h>
++static double llama_host_mark_ms() {
++#ifdef __APPLE__
++    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e6;
++#else
++    struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6;
++#endif
++}
+ 
+ //
+ // llama_context
+@@ -1417,7 +1425,7 @@ bool llama_context::set_adapter_cvec(
+ static void llama_host_mark(const char * what, int n) {
+     static const bool on = getenv("LLAMA_HOST_MARK") != nullptr;
+     if (on) {
+-        fprintf(stderr, "host-mark: %s n=%d t=%.3f\n", what, n, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e6);
++        fprintf(stderr, "host-mark: %s n=%d t=%.3f\n", what, n, llama_host_mark_ms());
+     }
+ }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

@@ -1,5 +1,5 @@
 #!/bin/bash
-# mac125b best state (tag mac125b-best-2026-10-11f, pinned build in ~/llama-best):
+# mac125b best state (tag mac125b-best-2026-10-12a, pinned build in ~/llama-best):
 # Qwen3.8-Flash-Next 125B IQ3_XXS + MTP head, thinking off, OpenAI-compatible server on http://127.0.0.1:${PORT:-8080}/v1
 #   ~/run-best.sh            start in the background (log: ~/llama-best.log), waits until ready
 #   ~/run-best.sh stop       stop it
