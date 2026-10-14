@@ -1,0 +1,12 @@
+Explain how a hash map handles collisions, with a short example in C.
+Write a bash script that finds the ten largest files under a directory and prints their sizes in a human readable form.
+日本の四季について、それぞれの季節の特徴と代表的な行事を説明してください。
+Summarize the causes and consequences of the French Revolution in a few paragraphs.
+A train leaves at 9:40 and travels 230 km at 80 km/h, then 120 km at 60 km/h. When does it arrive? Show the steps.
+Write a SQL query that returns, for each customer, the total amount of their orders in 2024 and their rank by that amount.
+Write a haiku sequence about the ocean at night, then explain the imagery you used.
+Compare Rust and Go for writing a network service: memory safety, concurrency, tooling and deployment.
+次の文章を英語に翻訳してください:「明日の会議は午後三時から第二会議室で行います。資料は事前に共有します。」
+Write a JavaScript debounce function and a test that checks it only fires once for rapid calls.
+Describe the water cycle for a ten-year-old, using a story about a single drop of water.
+Give a step-by-step plan to migrate a monolithic web application to microservices, including risks.

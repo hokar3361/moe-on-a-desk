@@ -38,6 +38,7 @@ IQ3_XXS GSQ-RCO file as the baseline, fully GPU resident — and all gains come 
 - `AGENTS.md` — the rules the project follows (fixed baselines and metric, what counts as a result, no cheating)
 - `mac125b/patches/` — the fork as `git format-patch` output on upstream llama.cpp `781dbc5`
 - `mac125b/tools/` — measurement, verification, kernel micro-benchmarks, analysis, MTP training, a comparison console
+- `wsl/` — the Windows (WSL2) + NVIDIA edition: README, log, 3 more patches on top of `mac125b/patches`, tools
 
 ## Tested on (the only machine so far)
 
@@ -128,6 +129,23 @@ GGML_ALLOC_FREE_DELAY=4 LLAMA_GRAPH_CACHE=16 LLAMA_SPEC_STOP=1 LLAMA_SPEC_STOP_P
 (`LLAMA_SPEC_MTP_MERGE`, used for the 125B model, lowers this model's draft acceptance and is left off.) The full log is
 `mac125b/DESIGN.md` §32. Only this Mac Studio (M4 Max, 64 GB) has been measured; smaller Macs are the next question.
 
+## Windows (WSL2) + RTX 4090 edition (2026-10-14)
+
+The same model and file on a gaming PC (Core i9-14900K, DDR5 128 GB, **RTX 4090 24 GB**, Windows 11 + WSL2), where it does not fit in VRAM.
+The experts stay in RAM and the GPU keeps a cache of the ones in use (llama.cpp's `--cpu-moe --moe-cache-mib`, our baseline);
+on top of it we page-lock the experts and moved the cache lookup onto the GPU (a new op, `GGML_OP_MOE_FETCH`: the GPU reads the
+missing experts straight from RAM, one CUDA graph per forward, no host round trip per layer). **The VRAM footprint is set by the
+cache size**, and the CPU stays at about 3 %. Details, caveats and the machine: [`wsl/README.md`](wsl/README.md) (Japanese).
+
+| (WSL2, RTX 4090, fixed metric) | VRAM | bench 1K | bench 4K | code 400 | prose 400 |
+|---|---:|---:|---:|---:|---:|
+| llama.cpp 781dbc5, unmodified, expert cache 14 GB, MTP 3 (best depth) | 23 GB | 116.7 | 115.3 | 64.6 | 63.1 |
+| **this work** (`wsl/patches`, cache 14 GB, MTP 4) | **22 GB** | **130.8** | **139.5** | **95.3** | **81.1** |
+| llama.cpp 781dbc5, unmodified, expert cache 6.7 GB, no MTP | 12 GB | 28.7 | 30.3 | 30.7 | 38.0 |
+| **this work**, cache 6.7 GB, no MTP | **12 GB** | **38.7** | **39.3** | **41.6** | **48.7** |
+
+Outputs are identical to the unmodified build at the same draft depth. Prompt processing (180-270 tok/s) is not improved yet.
+
 ## How much the output quality has been checked (honestly: lightly)
 
 Checked:
@@ -211,7 +229,8 @@ Verify before trusting a build:
 
 ## Caveats
 
-- **One machine, one model, Metal only.** The CUDA / CPU paths of the fork are upstream's and were only built, not tuned.
+- **One machine per platform.** The Mac results come from one Mac Studio (Metal); the CUDA results from one RTX 4090 PC under WSL2
+  (`wsl/`). On CUDA, apply `wsl/patches` too: without patch 0056 the Mac series crashes after about 256 tokens.
 - **Fixed bug.** Checkpoints `-11b` to `-11e` contain a fusion that corrupts prompt batches of ≥ 64 tokens when
   `GGML_ALLOC_FREE_DELAY` is not set (PPL 1.23 → 253 at ubatch 512). Every configuration measured here sets it, so the
   numbers stand, but use `-11f` or later.

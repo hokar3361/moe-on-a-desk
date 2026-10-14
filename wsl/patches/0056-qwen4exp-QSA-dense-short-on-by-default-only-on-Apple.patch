@@ -1,0 +1,30 @@
+From 4ef484011f3cb8ff5b21dede5400b870104586e1 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Wed, 14 Oct 2026 20:28:45 +0900
+Subject: [PATCH 56/58] qwen4exp: QSA dense-short on by default only on Apple
+ (CUDA sparse FA faults with the causal mask)
+
+---
+ src/models/qwen4exp.cpp | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 3fcbe5f41..32e144c24 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -825,7 +825,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
+ 
+     // every pool selected: the selection mask is the causal mask (selected cells add 0, the rest are masked anyway)
+     {
++        #ifdef __APPLE__
+         static const bool dense_short = getenv("LLAMA_QSA_DENSE_SHORT") == nullptr || atoi(getenv("LLAMA_QSA_DENSE_SHORT")) != 0;
++#else
++        // verified only on Metal; the CUDA sparse flash attention faults with the plain causal mask near 256 tokens
++        static const bool dense_short = getenv("LLAMA_QSA_DENSE_SHORT") != nullptr && atoi(getenv("LLAMA_QSA_DENSE_SHORT")) != 0;
++#endif
+         if (dense_short && n_pool <= (int64_t) (hparams.indexer_top_k / kpool)) {
+             return kq_mask;
+         }
+-- 
+2.43.0
+

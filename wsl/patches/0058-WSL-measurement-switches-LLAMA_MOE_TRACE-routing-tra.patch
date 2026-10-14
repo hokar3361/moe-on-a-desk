@@ -1,0 +1,182 @@
+From 081e39d3bc02fefd8511105229e49229af7d1254 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Wed, 14 Oct 2026 22:41:38 +0900
+Subject: [PATCH 58/58] WSL: measurement switches (LLAMA_MOE_TRACE routing
+ trace, GGML_MOE_FETCH_FIXED / GGML_MOE_FETCH_NOCOPY, GGML_CUDA_SKIP),
+ MOE_FETCH log, opt-in GGML_CUDA_MMVF_MAX for F16/BF16 matmuls
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 29 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvf.cu      |  7 +++++++
+ ggml/src/ggml-cuda/moe-fetch.cu | 14 +++++++++-----
+ src/llama-moe-cache.cpp         | 22 ++++++++++++++++++++++
+ 4 files changed, 67 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ce8431e35..547a2f9cf 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2171,7 +2171,36 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+         nb1, nb2, nb3, stream);
+ }
+ 
++static bool ggml_cuda_skip_node(const ggml_tensor * dst) {
++    static std::vector<std::string> pats = [] {
++        std::vector<std::string> v;
++        const char * e = getenv("GGML_CUDA_SKIP");
++        if (e) {
++            std::string s = e, cur;
++            for (char c : s) { if (c == ',') { if (!cur.empty()) v.push_back(cur); cur.clear(); } else cur += c; }
++            if (!cur.empty()) v.push_back(cur);
++        }
++        return v;
++    }();
++    if (pats.empty() || dst->op == GGML_OP_MOE_FETCH) {
++        return false;
++    }
++    for (const auto & p : pats) {
++        std::string op = p, ty, nm;
++        const size_t a = op.find('@'); if (a != std::string::npos) { nm = op.substr(a + 1); op = op.substr(0, a); }
++        const size_t b = op.find(':'); if (b != std::string::npos) { ty = op.substr(b + 1); op = op.substr(0, b); }
++        if (op != ggml_op_name(dst->op)) continue;
++        if (!ty.empty() && (!dst->src[0] || ty != ggml_type_name(dst->src[0]->type))) continue;
++        if (!nm.empty() && std::string(dst->name).find(nm) == std::string::npos) continue;
++        return true;
++    }
++    return false;
++}
++
+ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
++    if (ggml_cuda_skip_node(dst)) {
++        return true;
++    }
+     switch (dst->op) {
+         case GGML_OP_ARGMAX:
+             ggml_cuda_argmax(ctx, dst);
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d0a572e15..3dd0276f1 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -807,6 +807,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
+         }
+     }
+ 
++    {
++        static const int mmvf_max = getenv("GGML_CUDA_MMVF_MAX") ? atoi(getenv("GGML_CUDA_MMVF_MAX")) : 0;
++        if (mmvf_max > 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && (type == GGML_TYPE_F16 || type == GGML_TYPE_BF16)) {
++            return ne11 <= std::min(mmvf_max, MMVF_MAX_BATCH_SIZE);
++        }
++    }
++
+     switch (type) {
+         case GGML_TYPE_F32:
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+diff --git a/ggml/src/ggml-cuda/moe-fetch.cu b/ggml/src/ggml-cuda/moe-fetch.cu
+index 07e6d1313..d3390c56b 100644
+--- a/ggml/src/ggml-cuda/moe-fetch.cu
++++ b/ggml/src/ggml-cuda/moe-fetch.cu
+@@ -11,7 +11,7 @@
+ #define FETCH_COPY_BLOCKS 12
+ 
+ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const int n_ids, int32_t * __restrict__ st,
+-        int32_t * __restrict__ pool, const int n_expert, const int n_trace, const int tbase, const int n_trans, int32_t * __restrict__ out) {
++        int32_t * __restrict__ pool, const int n_expert, const int n_trace, const int tbase, const int n_trans, int32_t * __restrict__ out, const bool fixed) {
+     extern __shared__ int32_t owner[]; // [n_expert]: smallest index of the ids that select the expert, then -2 - slot
+     __shared__ int s_nt, s_nm, s_tr;
+ 
+@@ -31,12 +31,12 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+     }
+     __syncthreads();
+     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+-        atomicMin(&owner[ids[i]], i);
++        atomicMin(&owner[fixed ? i % 10 : ids[i]], i);
+     }
+     __syncthreads();
+ 
+     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+-        const int e = ids[i];
++        const int e = fixed ? i % 10 : ids[i];
+         if (owner[e] != i) {
+             continue;
+         }
+@@ -69,7 +69,7 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+     __syncthreads();
+ 
+     for (int i = threadIdx.x; i < n_ids; i += blockDim.x) {
+-        out[i] = -2 - owner[ids[i]];
++        out[i] = -2 - owner[fixed ? i % 10 : ids[i]];
+     }
+     if (threadIdx.x == 0) {
+         *p_nt = min(s_nt, n_trace);
+@@ -138,9 +138,13 @@ void ggml_cuda_op_moe_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+ 
+     int32_t * st = (int32_t *) state->data;
+     k_moe_fetch_plan<<<1, 256, n_expert*sizeof(int32_t), stream>>>((const int32_t *) ids->data, n_ids, st, (int32_t *) pool->data,
+-            n_expert, n_trace, tbase, n_trans, (int32_t *) dst->data);
++            n_expert, n_trace, tbase, n_trans, (int32_t *) dst->data, getenv("GGML_MOE_FETCH_FIXED") != nullptr);
+     CUDA_CHECK(cudaGetLastError());
+ 
++    static const bool nocopy = getenv("GGML_MOE_FETCH_NOCOPY") != nullptr; // measurement only: wrong outputs
++    if (nocopy) {
++        return;
++    }
+     const int32_t * p_nm = st + n_expert + 1 + 2*n_trace;
+     k_moe_fetch_copy<<<FETCH_COPY_BLOCKS, 256, 0, stream>>>(p_nm, (const int64_t *) desc->data);
+     CUDA_CHECK(cudaGetLastError());
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 778f36114..3189c4c08 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -536,6 +536,8 @@ struct llama_moe_cache::impl {
+     ggml_tensor * f_pools = nullptr; // I32 [1 + f_pool, n_group]
+     std::vector<int32_t> f_pool_host;
+     std::vector<float>   f_peak; // [group] decaying peak of the misses per forward
++    FILE * f_trace_file = nullptr;
++    size_t f_trace_fwd  = 0;
+     std::vector<int32_t> f_host;
+     std::vector<std::vector<uint8_t>> f_reserved; // [group][slot]: in the free pool
+     size_t f_hit = 0, f_new = 0, f_tr = 0, f_evict = 0, f_forwards = 0, f_mismatch = 0, f_calls = 0;
+@@ -589,6 +591,18 @@ struct llama_moe_cache::impl {
+         f_host.assign((size_t) f_row*layers.size(), 0);
+         f_pool_host.assign((size_t) (1 + f_pool)*groups.size(), 0);
+         f_peak.assign(groups.size(), 8.0f);
++        if (getenv("LLAMA_MOE_TRACE")) {
++            f_trace_file = fopen(getenv("LLAMA_MOE_TRACE"), "a");
++            if (f_trace_file) {
++                for (size_t ig = 0; ig < groups.size(); ++ig) {
++                    fprintf(f_trace_file, "# group %zu %d", ig, groups[ig].lru.n_slots);
++                    for (int32_t il : groups[ig].layers) {
++                        fprintf(f_trace_file, " %d", il);
++                    }
++                    fprintf(f_trace_file, "\n");
++                }
++            }
++        }
+         f_reserved.resize(groups.size());
+         for (size_t ig = 0; ig < groups.size(); ++ig) {
+             f_reserved[ig].assign(groups[ig].lru.n_slots, 0);
+@@ -626,6 +640,7 @@ struct llama_moe_cache::impl {
+             ggml_backend_tensor_get(f_state, f_host.data(), 0, ggml_nbytes(f_state));
+             ggml_backend_tensor_get(f_pools, f_pool_host.data(), 0, ggml_nbytes(f_pools));
+             f_forwards++;
++            f_trace_fwd++;
+         }
+         f_calls++;
+ 
+@@ -638,6 +653,13 @@ struct llama_moe_cache::impl {
+             group & g = groups[layers[il].ig];
+             const int32_t * row = &f_host[(size_t) f_row*il];
+             const int32_t nt = std::min(row[o_nt], f_trace);
++            if (f_trace_file && nt > 0) {
++                fprintf(f_trace_file, "%zu %zu %d", f_trace_fwd, il, layers[il].ig);
++                for (int32_t t = 0; t < nt; ++t) {
++                    fprintf(f_trace_file, " %d", row[o_tr + 2*t]);
++                }
++                fprintf(f_trace_file, "\n");
++            }
+             for (int32_t t = 0; t < nt; ++t) {
+                 const int32_t e = row[o_tr + 2*t];
+                 const int32_t v = row[o_tr + 2*t + 1];
+-- 
+2.43.0
+
