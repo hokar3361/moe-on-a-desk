@@ -2,7 +2,10 @@
 
 **ゲーミング PC(RTX 4090 24 GB+DDR5)で、125B の MoE モデルを量子化を落とさずに、PC に余力を残したまま速く動かす。**
 [moe-on-a-desk](../README.md) の Windows(WSL2)版です。Mac Studio 向けに作った考え方を CUDA に持ち込み、
-**Qwen3.8-Flash-Next 125B(IQ3_XXS、47 GB)を、CPU 使用率 約 3%・VRAM 12〜22 GB(キャッシュの大きさで選べる)で**動かします。
+**Qwen3.8-Flash-Next 125B(IQ3_XXS、47 GB)を、CPU 使用率 約 3%・専用 GPU メモリ(VRAM)12〜22 GB(キャッシュの大きさで選べる)で**動かします。
+
+この文書の「VRAM」は、グラフィックボードに載っているメモリのことで、Windows のタスクマネージャー([パフォーマンス] → [GPU])の
+**「専用 GPU メモリ」**に当たります。同じ画面の「共有 GPU メモリ」(GPU が借りて使う普通の RAM)とは別のものです。
 
 *The Windows (WSL2) edition of moe-on-a-desk: Qwen3.8-Flash-Next 125B (IQ3_XXS, 47 GB, unchanged quantization) on a gaming PC with
 an RTX 4090, at about 3 % CPU and a VRAM footprint you choose with one option (12-22 GB). Against unmodified llama.cpp with its own
@@ -14,7 +17,7 @@ build at the same draft depth. One machine tested; see the caveats.*
 > - **メモリを大量に固定します。** 既定の構成では、モデルファイルのうちエキスパートの部分(約 40 GiB)を RAM 上でページ固定します
 >   (OS が退避できなくなります)。サーバーのプロセスは RAM を 約 46 GB 使います。WSL に十分なメモリを割り当て(実験機は 112 GB)、
 >   ほかの重いアプリと同時に動かす場合はご注意ください。
-> - **VRAM は指定した分を占有します。** 画面表示やほかのアプリの分を残してください。VRAM が満杯に近いと Windows 側の退避が起きて大きく遅くなります。
+> - **専用 GPU メモリ(VRAM)は指定した分を占有します。** 画面表示やほかのアプリの分を残してください。VRAM が満杯に近いと Windows 側の退避が起きて大きく遅くなります。
 > - **llama.cpp を土台にしていますが、改造による副作用は多くの機種では確かめていません。** 確かめたのは下記の 1 台(RTX 4090、WSL2)だけです。
 >   ほかの GPU・ドライバ・ネイティブ Linux / Windows では、遅くなる・出力が変わる・動かないといった可能性があります。
 >   重要な用途では、未改造の llama.cpp の出力と比べるなどして確認してください。
@@ -49,7 +52,7 @@ Mac は CPU と GPU がメモリを共有していますが、PC では PCIe(実
 ## 結果(この PC、固定指標)
 
 計測方法は moe-on-a-desk と同じです(`tools/abw.sh`:bench-strata 1K/4K、コード・文章 400 トークン greedy、サーバの timings、思考なし)。
-CPU は 32 スレッド全体に対する平均使用率、VRAM は GPU 全体の使用量(Windows の画面表示など 約 1 GB を含む)です。
+CPU は 32 スレッド全体に対する平均使用率、VRAM は GPU 全体の専用 GPU メモリの使用量(Windows の画面表示など 約 1 GB を含む)です。
 
 ### VRAM 22 GB(既定)
 
@@ -82,7 +85,7 @@ CPU は 32 スレッド全体に対する平均使用率、VRAM は GPU 全体�
 
 12 GB では下書きなしが最良です(キャッシュが小さいと、下書きで検証の幅が広がった分のエキスパートの取りこぼしが効くため)。
 
-## 専有 VRAM はキャッシュの大きさで決まる
+## 専用 GPU メモリ(VRAM)の使用量はキャッシュの大きさで決まる
 
 VRAM の使い道は「固定分」+「エキスパートのキャッシュ」です。
 
@@ -203,7 +206,7 @@ LLAMA_MOE_CACHE_FETCH=1 build/bin/llama-server -m Qwen3.8-Flash-Next-GSQ-RCO-IQ3
 
 - **RAM**:エキスパート 約 40 GiB をページ固定します(登録は 約 0.7 秒)。サーバーの RSS は 約 46 GB。WSL への割り当てが少ない PC では動かないか、
   ほかのアプリが極端に遅くなるおそれがあります(実験機は WSL に 112 GB)。64 GB 以下の PC は未確認です。
-- **VRAM**:指定した分を占有します。満杯に近いと大きく遅くなります(上記)。ゲームなど GPU を使うアプリとの同時使用は想定していません。
+- **専用 GPU メモリ(VRAM)**:指定した分を占有します。満杯に近いと大きく遅くなります(上記)。ゲームなど GPU を使うアプリとの同時使用は想定していません。
 - **長いプロンプトの読み込みは遅い**:毎秒 180〜270 トークン程度(大きなバッチでは層ごとにエキスパート全体を PCIe で送るため。手を入れていません)。
 - **最初の数回・話題が変わった直後は遅い**:キャッシュが温まるまで取りこぼしが多くなります。日本語は英語より遅めです。
 - **Mac 版のパッチを CUDA で使う場合は patch 0056 が必要**です(無いと短いプロンプトから 約 256 トークン目で `illegal memory access` で落ちます)。
