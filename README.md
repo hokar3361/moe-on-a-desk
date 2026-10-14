@@ -10,6 +10,21 @@ publishes everything we built for one Mac Studio: the results, the llama.cpp for
 It has been tested on **one machine only**, and output quality has only been checked lightly — **reports from other
 machines, quality evaluations, issues and PRs are very welcome** (see [Help wanted](#help-wanted)).
 
+> **ご利用にあたっての注意(必ずお読みください)**
+> - **自己責任でお使いください。** 本リポジトリのコード・手順・数値は無保証です。利用によって生じたいかなる損害についても、作者は責任を負いません。
+> - **機材に高い負荷がかかります。** 大きなモデルを動かすため、GPU・メモリ・SSD を長時間ほぼ使い切ります。発熱・消費電力・ファンの騒音が大きくなり、
+>   メモリが足りないとほかのアプリが極端に遅くなったり、OS が応答しなくなったりすることがあります。SSD からモデルを読み続ける使い方では SSD の読み出しも多くなります。
+>   作業中のデータは保存してから、様子を見ながらお試しください。
+> - **llama.cpp を土台にしていますが、改造による副作用は多くの機種では確かめていません。** 動作と数値を確認したのは 1 台の Mac Studio(M4 Max、64 GB)だけです。
+>   カーネルのしきい値などはこの GPU に合わせてあり、ほかのチップ・メモリ容量・OS の版では、遅くなる・出力が変わる・動かないといった可能性があります。
+>   重要な用途では、未改造の llama.cpp の出力と比べるなどして確認してください。
+>
+> **Before you use this:** use it at your own risk; it comes with no warranty of any kind. It puts a heavy, sustained load on the GPU,
+> memory and SSD (heat, power draw, fan noise; other apps or the OS may become unresponsive when memory runs short). It is based on
+> llama.cpp, but the side effects of these modifications have not been checked on other machines: only one Mac Studio (M4 Max, 64 GB)
+> was tested, kernel thresholds were tuned for it, and other chips, memory sizes or OS versions may run slower, give different output
+> or fail. For anything important, compare with unmodified llama.cpp.
+
 ---
 
 ## What this is
