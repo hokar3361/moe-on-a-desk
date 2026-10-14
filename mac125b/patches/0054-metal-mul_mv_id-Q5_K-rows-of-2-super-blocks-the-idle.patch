@@ -1,0 +1,83 @@
+From e744c17131431a216ce382d955d726e5a45975a7 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Wed, 14 Oct 2026 13:10:46 +0900
+Subject: [PATCH 54/55] metal: mul_mv_id Q5_K rows of <= 2 super-blocks: the
+ idle half of the lanes takes a second row group, partials moved back to the
+ plain lane positions before the reduction (bit-identical);
+ GGML_METAL_Q5K_DUAL=0 restores
+
+---
+ ggml/src/ggml-metal/ggml-metal-device.cpp |  6 ++++++
+ ggml/src/ggml-metal/kernels/mul_mv.metal  | 25 +++++++++++++++++++++--
+ 2 files changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.cpp b/ggml/src/ggml-metal/ggml-metal-device.cpp
+index 9fb70d9..1775bff 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.cpp
++++ b/ggml/src/ggml-metal/ggml-metal-device.cpp
+@@ -1498,6 +1498,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
+             {
+                 nsg = N_SG_Q5_K;
+                 nr0 = N_R0_Q5_K;
++                // rows of <= 2 super-blocks (MoE down, K <= 512): the idle half of the lanes takes a second row group
++                static const bool dual = !getenv("GGML_METAL_Q5K_DUAL") || atoi(getenv("GGML_METAL_Q5K_DUAL")) != 0;
++                if (dual && ne00 <= 2*256) {
++                    nr0 = 2*N_R0_Q5_K;
++                    split = true;
++                }
+             } break;
+         case GGML_TYPE_Q6_K:
+             {
+diff --git a/ggml/src/ggml-metal/kernels/mul_mv.metal b/ggml/src/ggml-metal/kernels/mul_mv.metal
+index 3295550..eb0b1c1 100644
+--- a/ggml/src/ggml-metal/kernels/mul_mv.metal
++++ b/ggml/src/ggml-metal/kernels/mul_mv.metal
+@@ -1659,7 +1659,11 @@ void kernel_mul_mv_q5_K_f32_impl(
+     const int r1 = tgpig.y;
+     const int im = tgpig.z;
+ 
+-    const int first_row = (r0 * NSG + sgitg) * nr0;
++    // FC_mul_mv_split (host: rows of <= 2 super-blocks): the lanes with tiisg%4 >= 2, idle in the plain layout, take a
++    // second group of nr0 rows; their partials go back to the plain layout's lane positions before the reduction
++    const bool  dual = FC_mul_mv_split;
++    const short grp  = dual && (tiisg%4) >= 2 ? 1 : 0;
++    const int first_row = (r0 * NSG + sgitg) * nr0 * (dual ? 2 : 1) + grp*nr0;
+ 
+     const uint i12 = im%FC_mul_mv_ne12;
+     const uint i13 = im/FC_mul_mv_ne12;
+@@ -1679,7 +1683,7 @@ void kernel_mul_mv_q5_K_f32_impl(
+     constexpr uint16_t kmask3 = 0xc0c0;
+ 
+     const short tid = tiisg/4;
+-    const short ix  = tiisg%4;
++    const short ix  = tiisg%4 - 2*grp;
+     const short iq  = tid/4;
+     const short ir  = tid%4;
+ 
+@@ -1751,6 +1755,23 @@ void kernel_mul_mv_q5_K_f32_impl(
+ 
+     device float * dst_f32 = (device float *) dst + (uint64_t)im*args.ne0*args.ne1 + (uint64_t)r1*args.ne0;
+ 
++    if (dual) {
++        const int frA = first_row - grp*nr0;
++        for (int row = 0; row < nr0; ++row) {
++            const float totA = simd_sum(grp == 0 ? sumf[row] : 0.f);
++            const float totB = simd_sum(simd_shuffle_xor(grp == 1 ? sumf[row] : 0.f, 2));
++            if (tiisg == 0) {
++                if (frA + row < args.ne0) {
++                    dst_f32[frA + row] = totA;
++                }
++                if (frA + nr0 + row < args.ne0) {
++                    dst_f32[frA + nr0 + row] = totB;
++                }
++            }
++        }
++        return;
++    }
++
+     for (int row = 0; row < nr0 && first_row + row < args.ne0; ++row) {
+         const float tot = simd_sum(sumf[row]);
+         if (tiisg == 0) {
+-- 
+2.50.1 (Apple Git-155)
+

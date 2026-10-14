@@ -1,7 +1,7 @@
 From 73ca336d30605b73c9f90b6fe9737954832a49c9 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 21:22:52 +0900
-Subject: [PATCH 50/52] llama-context: portable host-mark clock
+Subject: [PATCH 50/55] llama-context: portable host-mark clock
  (CLOCK_MONOTONIC off Apple)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -38,5 +38,5 @@ index 73847ff..97c8ffa 100644
  }
  
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

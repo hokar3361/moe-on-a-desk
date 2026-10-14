@@ -1,7 +1,7 @@
 From 51538aa45469ebe187db1fce302df790dddfa663 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:08:26 +0900
-Subject: [PATCH 04/52] qwen4exp/metal: hc mix as one persistent dispatch with
+Subject: [PATCH 04/55] qwen4exp/metal: hc mix as one persistent dispatch with
  grid sync (v1)
 
 ---
@@ -79,7 +79,7 @@ diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-
 index 13aecbd..910bec2 100644
 --- a/ggml/src/ggml-metal/ggml-metal-device.m
 +++ b/ggml/src/ggml-metal/ggml-metal-device.m
-@@ -917,6 +917,9 @@ struct ggml_metal_device {
+@@ -917,6 +917,9 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
  
      // virtual address for GPU memory allocations
      atomic_uintptr_t addr_virt;
@@ -626,5 +626,5 @@ index c1771fc..d9687b6 100644
  }
  
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

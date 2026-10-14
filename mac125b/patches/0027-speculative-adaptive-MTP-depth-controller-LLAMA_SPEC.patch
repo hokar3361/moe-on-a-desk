@@ -1,7 +1,7 @@
 From 3b88b2e04673437733afd4068fb4ebfd8cb97aff Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:27:34 +0900
-Subject: [PATCH 27/52] speculative: adaptive MTP depth controller
+Subject: [PATCH 27/55] speculative: adaptive MTP depth controller
  (LLAMA_SPEC_DEPTH_CTL=1)
 
 ---
@@ -126,5 +126,5 @@ index 7e0b1ae..b824d70 100644
              const int32_t L = lk_last[seq_id];
              lk2_rounds++;
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

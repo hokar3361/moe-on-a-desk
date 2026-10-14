@@ -1,7 +1,7 @@
 From de631d037afe455e47c963ae001dbe4a3419be69 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:54:36 +0900
-Subject: [PATCH 30/52] metal: GGML_METAL_MM_ID_MIN diagnostic threshold
+Subject: [PATCH 30/55] metal: GGML_METAL_MM_ID_MIN diagnostic threshold
 
 ---
  ggml/src/ggml-metal/ggml-metal-common.cpp | 5 ++++-
@@ -28,5 +28,5 @@ index a00f87c..206f362 100644
  
  // the most src1 rows of the few-row MMA kernels
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

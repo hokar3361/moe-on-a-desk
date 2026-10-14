@@ -1,7 +1,7 @@
 From b574db59f56f93724e1ae26e02f6beb9c16a69e2 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 17:02:58 +0900
-Subject: [PATCH 41/52] metal: fewer stages on the verify pass (outputs
+Subject: [PATCH 41/55] metal: fewer stages on the verify pass (outputs
  bit-identical)
 
 - graph reorder may move CONCAT/SOFT_MAX/DSV4_HC_PRE/POST/FILL/CUMSUM/ARGSORT/TOP_K/GATED_DELTA_NET/FLASH_ATTN_EXT/LIGHTNING_INDEXER
@@ -441,5 +441,5 @@ index bbf53a5..a36c57b 100644
 +    dst_y[tid] = (float) (t / (1 + exp(-t)));
 +}
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

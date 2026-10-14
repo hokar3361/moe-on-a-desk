@@ -1,7 +1,7 @@
 From 08cd1b155ee9a36bcb755deccbc8b12605ebbab5 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 16:43:47 +0900
-Subject: [PATCH 39/52] profiling: GGML_METAL_PROF_NOBAR_OPS (drop barriers per
+Subject: [PATCH 39/55] profiling: GGML_METAL_PROF_NOBAR_OPS (drop barriers per
  op class), GGML_METAL_PROF_STAGELOG (stage map),
  GGML_METAL_PREFETCH_KB/MOE_KB (opt-in SLC weight prefetch, refuted)
 
@@ -154,5 +154,5 @@ index 541a933..8856422 100644
 +    }
 +}
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

@@ -1,7 +1,7 @@
 From 0e78e81ce77c21b5a930679e405ffa5894bf58ca Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 10:34:57 +0900
-Subject: [PATCH 34/52] spec/graph: graph cache per small-batch shape
+Subject: [PATCH 34/55] spec/graph: graph cache per small-batch shape
  (LLAMA_GRAPH_CACHE), delayed frees in the graph allocator
  (GGML_ALLOC_FREE_DELAY), MTP catch-up merged into the first draft step
  (LLAMA_SPEC_MTP_MERGE), depth controller reset per request and
@@ -563,5 +563,5 @@ index 69bc01c..d07894a 100644
      ggml_backend_buffer_ptr buf_output;
  
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

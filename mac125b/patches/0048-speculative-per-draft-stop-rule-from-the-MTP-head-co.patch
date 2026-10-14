@@ -1,7 +1,7 @@
 From 80aba3d05bcc96403b0ee5f41f268ac5bdbb25d7 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 19:43:25 +0900
-Subject: [PATCH 48/52] speculative: per-draft stop rule from the MTP head
+Subject: [PATCH 48/55] speculative: per-draft stop rule from the MTP head
  confidence (opt-in LLAMA_SPEC_STOP=1, logistic per position fitted on
  training prompts, maximises E[tokens]-lam*E[ms] with look-ahead); opt-in
  bayes depth controller (LLAMA_SPEC_DEPTH_BAYES, unstable, not used)
@@ -276,5 +276,5 @@ index ef9eca4..a2574c4 100644
              if (++dctl.rounds % 100 == 0) {
                  LOG_INF("%s: depth ctl rounds %llu depth %d a1..4 %.2f %.2f %.2f %.2f T(d) %.1f ms\n", __func__,
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

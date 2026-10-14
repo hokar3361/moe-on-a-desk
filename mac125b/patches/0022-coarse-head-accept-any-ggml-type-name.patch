@@ -1,7 +1,7 @@
 From ca5bda53cc639abf5dd2d7c66a8890f35fb62215 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 23:49:38 +0900
-Subject: [PATCH 22/52] coarse head: accept any ggml type name
+Subject: [PATCH 22/55] coarse head: accept any ggml type name
 
 ---
  src/llama-model.cpp | 9 ++++++---
@@ -28,5 +28,5 @@ index 8b2a8b0..90fdcb5 100644
              const int64_t t0 = ggml_time_us();
              output_coarse = llama_requantize_copy(output, type, "output_coarse", pimpl->ctxs_bufs);
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

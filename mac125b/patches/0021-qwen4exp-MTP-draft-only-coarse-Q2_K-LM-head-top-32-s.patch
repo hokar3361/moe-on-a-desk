@@ -1,7 +1,7 @@
 From 84fbd41a658a5c629cda83a592f041e1050bd623 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 23:45:45 +0900
-Subject: [PATCH 21/52] qwen4exp MTP: draft-only coarse Q2_K LM head, top-32
+Subject: [PATCH 21/55] qwen4exp MTP: draft-only coarse Q2_K LM head, top-32
  shortlist re-scored with the real head (+14-15% code/prose, identical output)
 
 ---
@@ -181,5 +181,5 @@ index d9687b6..42d5e01 100644
      res->t_logits = cur;
  
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

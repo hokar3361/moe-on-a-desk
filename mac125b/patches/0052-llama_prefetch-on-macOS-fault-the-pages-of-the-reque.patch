@@ -1,7 +1,7 @@
 From 12a3402172d27d678035ae2ebcd2359eadb4ce85 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Wed, 14 Oct 2026 08:27:45 +0900
-Subject: [PATCH 52/52] llama_prefetch on macOS: fault the pages of the
+Subject: [PATCH 52/55] llama_prefetch on macOS: fault the pages of the
  requested rows in concurrently (GCD), so the cold PLE n-gram table rows are
  read with many SSD requests in flight; LLAMA_PREFETCH_TOUCH=0 turns it off
 
@@ -65,5 +65,5 @@ index 045489d..deeabbc 100644
      if (mr.empty()) {
          return;
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

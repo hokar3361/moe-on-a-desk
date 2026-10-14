@@ -1,7 +1,7 @@
 From c6445f3352ef319ab1c7fb15005ad63986ada388 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:20:03 +0900
-Subject: [PATCH 07/52] metal: poll command buffer status instead of blocking
+Subject: [PATCH 07/55] metal: poll command buffer status instead of blocking
  (keeps SoC fabric clocks up, -10% decode time)
 
 ---
@@ -12,7 +12,7 @@ diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml
 index 701c17d..160680c 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
-@@ -263,10 +263,28 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
+@@ -263,10 +263,28 @@ void ggml_metal_free(ggml_metal_t ctx) {
      return ctx->name;
  }
  
@@ -43,5 +43,5 @@ index 701c17d..160680c 100644
      }
  
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

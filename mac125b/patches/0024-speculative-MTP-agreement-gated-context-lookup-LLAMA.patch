@@ -1,7 +1,7 @@
 From 28bb39acb7bcd2e2dcf5c062d230ea2122575ebb Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:13:19 +0900
-Subject: [PATCH 24/52] speculative: MTP-agreement-gated context lookup
+Subject: [PATCH 24/55] speculative: MTP-agreement-gated context lookup
  (LLAMA_SPEC_LOOKUP=1, opt-in) + LLAMA_SPEC_MTP_DEPTH
 
 ---
@@ -108,5 +108,5 @@ index eae6555..f04d134 100644
                      n_drafting--;
                      continue;
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

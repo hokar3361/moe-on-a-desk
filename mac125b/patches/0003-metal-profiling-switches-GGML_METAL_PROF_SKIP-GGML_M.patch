@@ -1,7 +1,7 @@
 From 16266a6aee39bbfb0cfa3ee3e6fe5a515b392d64 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:03:54 +0900
-Subject: [PATCH 03/52] metal: profiling switches GGML_METAL_PROF_SKIP /
+Subject: [PATCH 03/55] metal: profiling switches GGML_METAL_PROF_SKIP /
  GGML_METAL_PROF_NOBARRIER
 
 ---
@@ -66,5 +66,5 @@ index fe48c1c..3ac158d 100644
  
      // check if the current node can run concurrently with other nodes before it
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

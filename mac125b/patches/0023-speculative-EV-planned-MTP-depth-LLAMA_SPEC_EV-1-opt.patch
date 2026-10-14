@@ -1,7 +1,7 @@
 From efe9157b024494b39d027d9ed8e718bf24bc822f Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:00:38 +0900
-Subject: [PATCH 23/52] speculative: EV-planned MTP depth (LLAMA_SPEC_EV=1,
+Subject: [PATCH 23/55] speculative: EV-planned MTP depth (LLAMA_SPEC_EV=1,
  opt-in; slower as calibrated)
 
 ---
@@ -158,5 +158,5 @@ index c5043a4..eae6555 100644
          if (n_rows <= 0) {
              return;
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

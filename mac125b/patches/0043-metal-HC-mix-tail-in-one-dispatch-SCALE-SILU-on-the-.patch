@@ -1,7 +1,7 @@
 From 511a0fb52955a008dd0244acdcc96b5f7a098e0b Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 17:25:16 +0900
-Subject: [PATCH 43/52] metal: HC mix tail in one dispatch: SCALE -> SILU on
+Subject: [PATCH 43/55] metal: HC mix tail in one dispatch: SCALE -> SILU on
  the src1 load, bf16 few-row MMA with rows read as 4*e+stream, gated HC_PRE
  from the reduced tile (B >= 2, bit-identical); barriers 1515 -> 1325
 
@@ -309,5 +309,5 @@ index 5cf245d..d36f353 100644
 +template [[host_name("kernel_mul_mv_mma_bf16_hc_nt4_rt2")]] kernel kernel_mul_mv_mma_bf16_hc_t kernel_mul_mv_mma_bf16_hc<4, 2>;
 +#endif
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

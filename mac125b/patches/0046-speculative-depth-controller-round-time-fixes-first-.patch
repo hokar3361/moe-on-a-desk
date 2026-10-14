@@ -1,7 +1,7 @@
 From b6656a2aabd4fe80b3757659d1647a04fa3ad7a5 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 17:55:20 +0900
-Subject: [PATCH 46/52] speculative: depth controller round-time fixes (first
+Subject: [PATCH 46/55] speculative: depth controller round-time fixes (first
  round of a request not measured, first measurement of a depth must be
  plausible, monotone T(d), current verify priors; LLAMA_SPEC_DEPTH_FIX=0
  restores), opt-in KEEP_T / STEP / TRACE, metal command-buffer geometric split
@@ -106,5 +106,5 @@ index 11ae5d2..ef9eca4 100644
              dctl.exploring = false;
              // explore one deeper: often when the last drafted position is usually accepted, rarely otherwise
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

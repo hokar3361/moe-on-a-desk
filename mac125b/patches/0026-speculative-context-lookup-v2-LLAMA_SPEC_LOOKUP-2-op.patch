@@ -1,7 +1,7 @@
 From 00c85e01973e6bd61a1987f789f95d72bbd62f49 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:24:56 +0900
-Subject: [PATCH 26/52] speculative: context lookup v2 (LLAMA_SPEC_LOOKUP=2,
+Subject: [PATCH 26/55] speculative: context lookup v2 (LLAMA_SPEC_LOOKUP=2,
  opt-in)
 
 ---
@@ -137,5 +137,5 @@ index f04d134..7e0b1ae 100644
              // calibration: every drafted token up to and including the first rejection was "tried"
              const auto & lp = ev_last_p[seq_id];
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

@@ -1,7 +1,7 @@
 From 12d8306287a5ef16572a89d476889e8cb0276333 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 14:28:45 +0900
-Subject: [PATCH 35/52] spec: MTP pair dump (LLAMA_SPEC_MTP_DUMP) and recursion
+Subject: [PATCH 35/55] spec: MTP pair dump (LLAMA_SPEC_MTP_DUMP) and recursion
  adapter experiment (LLAMA_SPEC_MTP_ADAPTER, refuted; opt-in only)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -144,5 +144,5 @@ index 17365a9..11ae5d2 100644
                  }
              }
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

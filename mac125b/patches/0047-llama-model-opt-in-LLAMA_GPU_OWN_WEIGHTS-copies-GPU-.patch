@@ -1,7 +1,7 @@
 From 9f04902e56286529cf94f933253a61cac516e27a Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 19:43:25 +0900
-Subject: [PATCH 47/52] llama-model: opt-in LLAMA_GPU_OWN_WEIGHTS copies GPU
+Subject: [PATCH 47/55] llama-model: opt-in LLAMA_GPU_OWN_WEIGHTS copies GPU
  weights into backend-owned buffers (measurement: no change vs mmap-wrapped)
 
 ---
@@ -25,5 +25,5 @@ index 06c87a8..00c0178 100644
              for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                  // only the mmap region containing the tensors in the model is mapped to the backend buffer
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

@@ -75,6 +75,44 @@ graph reorder and ~10 small-op fusions for the hybrid model (bit-identical), exa
 and a **per-draft stop rule** that predicts acceptance from the draft head's own confidence (held-out AUC 0.888) and
 drafts only while the expected gain beats the measured cost.
 
+## Second model: Qwen3.6-35B-A3B (2026-10-14)
+
+Asked for by readers who want 26B-35B-class MoE models on smaller Macs: the same fork applied to
+**Qwen3.6-35B-A3B** (MoE, 256 experts, top-8, ~3B active, its own MTP head), file `Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf`
+(unsloth/Qwen3.6-35B-A3B-MTP-GGUF, 22.9 GB, the MTP block is inside the file), same Mac, same fixed metric.
+The baseline is unmodified llama.cpp 781dbc5 with the model's MTP head, and for every column we keep **the best of its
+depths 2 / 3 / 4** (the most favourable choice for the baseline).
+
+| | bench 1K | bench 4K | code 400 | prose 400 |
+|---|---:|---:|---:|---:|
+| llama.cpp 781dbc5, unmodified, MTP, best depth per column | 161.4 | 140.1 | 145.8 | 100.1 |
+| this work `moe35-best-2026-10-14a` (mean of 2 runs) | **226.9** | **220.2** | **207.6** | **132.4** |
+| | +41 % | +57 % | +42 % | +32 % |
+
+On 18 held-out prompts (not the fixed metric's) it averages 150.4 tok/s against 109.8 (+37 %), and every one of the 18
+is faster than the better of the baseline's depth 2 and depth 4 (by 1.28x at least). Three changes made it:
+
+1. **The draft stop rule, retrained for this model** (`mac125b/tools/stop35/`): the rule decides per draft whether one
+   more drafted token still pays, from the MTP head's own confidence. Its logistic models, the verify time by width and the
+   draft cost are now read from a file (`LLAMA_SPEC_STOP_PARAMS`), fitted on 48 training prompts (held-out AUC 0.883).
+   The draft cost was chosen on training prompts only.
+2. **Q5_K short rows in the Metal MoE kernel** (patch 0054): the expert down projections have rows of 512 weights (two
+   super-blocks), which left half of the SIMD lanes idle. The idle lanes now compute a second group of rows, and their partial
+   sums are moved back to the original lane positions before the reduction, so the outputs are bit-identical
+   (`GGML_METAL_Q5K_DUAL=0` restores the old dispatch). Verify passes of 4-8 tokens are 15-22 % faster.
+3. **A draft-only coarse output head** (patch 0055): each draft step read the full 248k x 2048 Q8_0 output head; now a
+   1-bit copy scores the vocabulary and only its top 32 are re-scored with the real rows. The target's verify pass is untouched.
+
+At a fixed draft depth the outputs are identical with and without changes 2 and 3; the code answer is also identical to the
+unmodified build. Run it with:
+
+```
+GGML_ALLOC_FREE_DELAY=4 LLAMA_GRAPH_CACHE=16 LLAMA_SPEC_STOP=1 LLAMA_SPEC_STOP_PARAMS=mac125b/tools/stop35/q36c.params   llama-server -m Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf -ngl 99 -c 16384 --reasoning off --spec-type draft-mtp --spec-draft-n-max 7
+```
+
+(`LLAMA_SPEC_MTP_MERGE`, used for the 125B model, lowers this model's draft acceptance and is left off.) The full log is
+`mac125b/DESIGN.md` §32. Only this Mac Studio (M4 Max, 64 GB) has been measured; smaller Macs are the next question.
+
 ## How much the output quality has been checked (honestly: lightly)
 
 Checked:

@@ -1,7 +1,7 @@
 From d32b907b8300219d8df2a21a894ac7da15b004a0 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 17:43:26 +0900
-Subject: [PATCH 45/52] qwen4exp: QSA with every pool selected (n_pool <=
+Subject: [PATCH 45/55] qwen4exp: QSA with every pool selected (n_pool <=
  top_k/kpool) uses the causal mask directly: skip the indexer query, scoring,
  top-k and mask build, keep the indexer cache updates (bit-identical);
  barriers 1282 -> 1025, verify -1.05 ms at B=1..6; LLAMA_QSA_DENSE_SHORT=0
@@ -82,5 +82,5 @@ index d5f5d6a..3d84be0 100644
      pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
      cb(pooled, "indexer_k", il);
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

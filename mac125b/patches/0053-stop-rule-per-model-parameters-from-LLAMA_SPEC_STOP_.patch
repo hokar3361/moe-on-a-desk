@@ -1,0 +1,63 @@
+From 4771902493c877fb8c7a33618f5b081caf51ed25 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Wed, 14 Oct 2026 13:05:23 +0900
+Subject: [PATCH 53/55] stop rule: per-model parameters from
+ LLAMA_SPEC_STOP_PARAMS (logistic models, qbar, verify ms by width, draft ms,
+ lam)
+
+---
+ common/speculative.cpp | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 6d0ada7..0f12a8a 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1592,6 +1592,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         int   first_pos = -1;
+         uint64_t rounds = 0, n_drafted = 0, n_stop_post = 0, n_stop_pre = 0;
+         static float lg(float p) { p = std::min(std::max(p, 1e-4f), 1.0f - 1e-4f); return logf(p/(1.0f - p)); }
++        // per-model parameters (LLAMA_SPEC_STOP_PARAMS): "<name> v1 v2 ..." per line; qbar from position 1, tv from width 0
++        void load(const char * path) {
++            FILE * fp = fopen(path, "r");
++            if (!fp) { LOG_WRN("stop rule: cannot read %s, keeping the built-in parameters\n", path); return; }
++            char line[4096];
++            int n_set = 0;
++            while (fgets(line, sizeof(line), fp)) {
++                char name[32];
++                int off = 0;
++                if (sscanf(line, "%31s%n", name, &off) != 1) continue;
++                float v[32];
++                int n = 0, used = 0;
++                const char * q = line + off;
++                while (n < 32 && sscanf(q, "%f%n", &v[n], &used) == 1) { q += used; ++n; }
++                auto put = [&](float * dst, int cap, int first) { for (int i = 0; i < n && first + i < cap; ++i) dst[first + i] = v[i]; ++n_set; };
++                const std::string nm = name;
++                if      (nm == "mu_post") put(mu_post, NF, 0);
++                else if (nm == "sd_post") put(sd_post, NF, 0);
++                else if (nm == "w_post")  put(w_post, NF + 1, 0);
++                else if (nm == "mu_pre")  put(mu_pre, NF, 0);
++                else if (nm == "sd_pre")  put(sd_pre, NF, 0);
++                else if (nm == "w_pre")   put(w_pre, NF + 1, 0);
++                else if (nm == "qbar")    put(qbar, 18, 1);
++                else if (nm == "tv")      put(tv, 18, 0);
++                else if (nm == "c_draft" && n > 0) { c_draft = v[0]; ++n_set; }
++                else if (nm == "lam" && n > 0)     { lam = v[0]; ++n_set; }
++            }
++            fclose(fp);
++            LOG_INF("stop rule: %d parameter sets from %s (draft %.2f ms, verify w=4 %.2f ms)\n", n_set, path, c_draft, tv[4]);
++        }
+         void reset_request() {
+             for (int k = 0; k < 18; ++k) ema[k] = 0.7f;
+             first_round = true; t_prev_us = 0; last_acc = -1; last_n = 0; first_pos = -1;
+@@ -1835,6 +1865,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (sr.enabled) {
+             sr.cap = params.draft.n_max;
+             if (const char * m = getenv("LLAMA_SPEC_DEPTH_MIN")) sr.dmin = std::max(1, atoi(m));
++            if (const char * f = getenv("LLAMA_SPEC_STOP_PARAMS")) sr.load(f);
+             if (const char * e = getenv("LLAMA_SPEC_STOP_LAM")) sr.lam = (float) atof(e);
+             if (const char * e = getenv("LLAMA_SPEC_STOP_LAM_A")) sr.lam_a = (float) atof(e);
+             sr.reset_request();
+-- 
+2.50.1 (Apple Git-155)
+

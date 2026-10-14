@@ -1,7 +1,7 @@
 From e7c75799a73f86506e143794312d1457047c8adc Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:29:01 +0900
-Subject: [PATCH 28/52] depth ctl: reject round-time outliers
+Subject: [PATCH 28/55] depth ctl: reject round-time outliers
 
 ---
  common/speculative.cpp | 4 +++-
@@ -23,5 +23,5 @@ index b824d70..ed05eaa 100644
                  }
              }
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

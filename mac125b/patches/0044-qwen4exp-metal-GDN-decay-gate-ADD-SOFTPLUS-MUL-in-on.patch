@@ -1,7 +1,7 @@
 From 6eb4390267bf07445aa18b0fa706188baa109413 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 17:29:40 +0900
-Subject: [PATCH 44/52] qwen4exp/metal: GDN decay gate ADD+SOFTPLUS+MUL in one
+Subject: [PATCH 44/55] qwen4exp/metal: GDN decay gate ADD+SOFTPLUS+MUL in one
  dispatch (registered fusion), gated norm builds sigmoid(z) first so
  RMS_NORM+MUL+MUL fuse (bit-identical); barriers 1325 -> 1282
 
@@ -168,5 +168,5 @@ index 477bbf7..d5f5d6a 100644
      return ggml_mul(ctx0, normalized, gated);
  }
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

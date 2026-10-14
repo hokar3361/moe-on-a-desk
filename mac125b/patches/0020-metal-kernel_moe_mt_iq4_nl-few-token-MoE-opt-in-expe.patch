@@ -1,7 +1,7 @@
 From eea59983f527dd7477924fe13d9d8d914852fbb9 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 23:41:40 +0900
-Subject: [PATCH 20/52] metal: kernel_moe_mt_iq4_nl (few-token MoE, opt-in
+Subject: [PATCH 20/55] metal: kernel_moe_mt_iq4_nl (few-token MoE, opt-in
  experiments)
 
 ---
@@ -245,5 +245,5 @@ index 4aa5c28..85a5dd2 100644
 +
 +template [[host_name("kernel_moe_mt_iq4_nl")]] kernel kernel_moe_mt_t kernel_moe_mt_iq4_nl<8>;
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

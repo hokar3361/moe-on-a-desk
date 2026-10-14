@@ -1,7 +1,7 @@
 From ab017207c5fa7b3c925af6c32dfcf669df64e67c Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 01:04:41 +0900
-Subject: [PATCH 31/52] depth ctl: acceptance-gated probes, minimum depth
+Subject: [PATCH 31/55] depth ctl: acceptance-gated probes, minimum depth
  (LLAMA_SPEC_DEPTH_MIN, default 3)
 
 ---
@@ -56,5 +56,5 @@ index 02b0247..099ea2b 100644
                  mtp_depth = use;
                  if (getenv("LLAMA_SPEC_DEPTH_LOG") && dctl.rounds_at % 25 == 0) {
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 

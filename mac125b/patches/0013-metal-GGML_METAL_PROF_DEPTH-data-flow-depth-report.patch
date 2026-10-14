@@ -1,7 +1,7 @@
 From aefa8dfbcb94e4b3b6dc9736a96efbb6ac8491b2 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:41:12 +0900
-Subject: [PATCH 13/52] metal: GGML_METAL_PROF_DEPTH data-flow depth report
+Subject: [PATCH 13/55] metal: GGML_METAL_PROF_DEPTH data-flow depth report
 
 ---
  ggml/src/ggml-metal/ggml-metal-context.m |  6 ++++
@@ -89,5 +89,5 @@ index 3729bac..e18fc29 100644
      return ctx->n_nodes();
  }
 -- 
-2.53.0
+2.50.1 (Apple Git-155)
 
