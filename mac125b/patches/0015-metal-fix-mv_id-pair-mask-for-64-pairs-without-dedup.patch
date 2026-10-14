@@ -1,7 +1,7 @@
 From e064296f9c068e07027db71909bb4bf3993b5279 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:44:19 +0900
-Subject: [PATCH 15/49] metal: fix mv_id pair mask for >64 pairs without dedup;
+Subject: [PATCH 15/52] metal: fix mv_id pair mask for >64 pairs without dedup;
  dedup opt-in
 
 ---
@@ -47,5 +47,5 @@ index 5f2eef4..9d77848 100644
          const int qs = q%args.nei0;
  
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

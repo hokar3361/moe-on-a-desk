@@ -1,7 +1,7 @@
 From d2e394c3f5e79d059436e23a05ed93d50c3ab20d Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:21:48 +0900
-Subject: [PATCH 08/49] metal: hc mix v4 (prefetch phase-2 weights before grid
+Subject: [PATCH 08/52] metal: hc mix v4 (prefetch phase-2 weights before grid
  sync) + stream profiling mode
 
 ---
@@ -283,5 +283,5 @@ index d4d3546..8902e39 100644
  
              float result = 0.0f;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

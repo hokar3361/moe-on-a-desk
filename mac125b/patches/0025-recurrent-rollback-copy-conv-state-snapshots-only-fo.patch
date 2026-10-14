@@ -1,7 +1,7 @@
 From bccf2142e7652080a2cb810822b67ba331be8f2d Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 00:16:21 +0900
-Subject: [PATCH 25/49] recurrent rollback: copy conv-state snapshots only for
+Subject: [PATCH 25/52] recurrent rollback: copy conv-state snapshots only for
  slots this ubatch can roll back
 
 ---
@@ -44,5 +44,5 @@ index 42d5e01..477bbf7 100644
      for (int64_t slot = 0; slot < n_slots; ++slot) {
          const int64_t s_idx = std::max<int64_t>(0, conv_input->ne[0] - state_cols - slot);
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

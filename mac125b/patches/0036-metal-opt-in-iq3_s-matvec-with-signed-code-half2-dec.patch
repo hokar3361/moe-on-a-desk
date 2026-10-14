@@ -1,7 +1,7 @@
 From 057eb80f9704f1d455c7dd2d090e53d9da552cf3 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 14:39:28 +0900
-Subject: [PATCH 36/49] metal: opt-in iq3_s matvec with signed-code half2
+Subject: [PATCH 36/52] metal: opt-in iq3_s matvec with signed-code half2
  decode and 16 live activations (GGML_METAL_IQ3S_MAGIC; -13% at B=4 in
  isolation, changes summation order)
 
@@ -160,5 +160,5 @@ index 97bf020..3295550 100644
                  const threadgroup uint32_t * table1 = qh[0] & kmask_iq2xs[2*l+0] ? svalues + 256 : svalues;
                  const threadgroup uint32_t * table2 = qh[0] & kmask_iq2xs[2*l+1] ? svalues + 256 : svalues;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

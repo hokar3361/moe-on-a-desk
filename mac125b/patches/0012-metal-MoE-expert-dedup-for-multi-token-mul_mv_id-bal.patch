@@ -1,7 +1,7 @@
 From b2b628c08e38da31cd40ce2315140d53a631c06b Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:35:00 +0900
-Subject: [PATCH 12/49] metal: MoE expert dedup for multi-token mul_mv_id
+Subject: [PATCH 12/52] metal: MoE expert dedup for multi-token mul_mv_id
  (ballot owner test)
 
 ---
@@ -137,5 +137,5 @@ index 0d1069f..cf3a2ac 100644
  
  typedef decltype(kernel_mul_mv_id<mmv_fn<kernel_mul_mv_t_t_disp<float, float>>>) kernel_mul_mv_id_t;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

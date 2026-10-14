@@ -1,7 +1,7 @@
 From 8519c1611c193ee777cc6488fc8600ac17eeee8f Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 15:45:22 +0900
-Subject: [PATCH 38/49] profiling: GGML_SCHED_TIME (host time of CPU splits)
+Subject: [PATCH 38/52] profiling: GGML_SCHED_TIME (host time of CPU splits)
  and LLAMA_HOST_MARK (decode phase timestamps on the Metal clock)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -90,5 +90,5 @@ index aa421bb..73847ff 100644
              return -2;
          }
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

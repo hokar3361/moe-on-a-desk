@@ -1,7 +1,7 @@
 From f9ba136803ef9717787ccca000feea2ac9c69441 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:48:22 +0900
-Subject: [PATCH 16/49] metal: SSM_CONV for few tokens: one thread per channel
+Subject: [PATCH 16/52] metal: SSM_CONV for few tokens: one thread per channel
  in 256-thread groups (was 1-2 thread groups)
 
 ---
@@ -73,5 +73,5 @@ index b21c53b..ab277e7 100644
    //const int64_t ncs = args.ne00;
    //const int64_t nr  = args.ne01;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

@@ -11,21 +11,31 @@ reduced to a one-line summary here and the new conclusion takes its place.
 
 ## 0. Result (fixed metric, same Mac, thinking off, MTP on; decode tok/s)
 
-Checkpoint: fork `~/llama.cpp` tag `mac125b-best-2026-10-11f` (run with `~/run-best.sh`). Earlier checkpoints:
-`mac125b-best-2026-10-11` 94.8 / 93.2 / 99.9 / 60.7, `-11b` 97.6 / 95.7 / 101.3 / 62.6, `-11c` 98.3 / 96.5 / 102.9 / 63.3,
-`-11d` 98.4 / 98.8 / 107.0 / 65.9, `-11e` 115.8 / 106.6 / 111.2 / 69.7.
+Checkpoint: fork tag `mac125b-best-2026-10-14a` (`mac125b/patches/` on upstream llama.cpp `781dbc5`; run with
+`mac125b/tools/measure/run-best.sh`). Earlier checkpoints: `-12a` 124.7 / 117.9 / 112.4 / 66.8 (mean of 3), `mac125b-best-2026-10-11` 94.8 / 93.2 / 99.9 / 60.7, `-11b` 97.6 / 95.7 / 101.3 / 62.6, `-11c` 98.3 / 96.5 / 102.9 / 63.3,
+`-11d` 98.4 / 98.8 / 107.0 / 65.9, `-11e` 115.8 / 106.6 / 111.2 / 69.7, `-11f` 125.8 / 109.7 / 110.3 / 70.9.
 
 | | Model | bench 1K | bench 4K | code 400 | prose 400 |
 |---|---|---:|---:|---:|---:|
 | Start: llama.cpp 781dbc5, unmodified | IQ3_XXS + MTP Q8_0 | 76.8 | 75.3 | 76.6 | 48.3 |
 | Sushi 1.2.1 (MLX-based) | Sushi-2.6bpw | 85.5 | 83.9 | 90.6 | 62.0 |
-| **This work** (mean of 2 runs) | same as start | **125.8** | **109.7** | **110.3** | **70.9** |
+| **This work** `-14a` (mean of 2 runs) | same as start | **125.4** | **117.7** | **117.1** | **70.4** |
 
-+64 / +46 / +44 / +47 % over the start; Sushi (its own 2.6 bpw quantization) is listed as a reference point on the same machine, not as a ranking. Code runs swing ±10 % (115.7 and 104.9). Target: +200 %.
++63 / +56 / +53 / +46 % over the start (`-14a`). `-12a` was +62 / +57 / +47 / +38 % (`-11f` side by side in the same session: 126.2 / 109.9 / 116.5 / 68.3; `-12a` is a bug fix, see §5; prose single runs swing 62-71); Sushi (its own 2.6 bpw quantization) is listed as a reference point on the same machine, not as a ranking. Code runs swing ±10 % (115.7 and 104.9). Target: +200 %.
 The code text is identical to the first checkpoint's; the prose text diverges at character 244. Every speculative configuration,
 including the earlier checkpoints, diverges from plain one-token greedy decoding after 200-300 characters: the verify width changes
 the rounding of near-tie logits. This is not introduced by the stop rule. Reference only (different quantization): TensorFold 0.6.6
 on the same Mac, MLX 4-bit (does not fit 64 GB, streams experts from SSD): 52.6 / 56.8 / 24.0 / 28.9.
+
+## 0b. Cold rows of the n-gram embedding table on macOS (`-14a`)
+
+Observation: without speculation, the first answer on a new topic ran 8 % slower than the same answer again (50.1 vs 54.3 tok/s);
+the fixed-metric texts, already warm, did not show it. The PLE n-gram table (27.5 GB, read lazily from the mmap row by row) is
+prefetched by `llama_prefetch`, which only had Linux (madvise) and Windows implementations: on macOS it did nothing, so each cold
+row was a page fault taken one at a time inside get_rows. Change: on Apple platforms, fault the pages of the requested rows in
+concurrently (GCD `dispatch_apply`) before the gather; reads only, outputs unchanged (byte-identical one-token outputs with it on
+and off; the 200-token md5 check passes). Effect: on eight never-seen story prompts, MTP configuration 64.9 → 71.9 tok/s (+11 %),
+without speculation 51.0 → 53.4 (+4.7 %); fixed metric 125.4 / 117.7 / 117.1 / 70.4 (two runs).
 
 ## 1. Where the time goes (the facts every design decision below rests on)
 
@@ -141,3 +151,22 @@ its second output could be allocated in that block output's memory once it was d
 (`GGML_ALLOC_FREE_DELAY=4`, used by every server configuration we measured) this never happened, so the fixed-metric numbers stand;
 without it, prompt batches of ≥ 64 tokens were corrupted (PPL 1.23 → 253 at ubatch 512). The fusion now refuses outputs that overlap its
 inputs. Since then every checkpoint is also checked for perplexity equal to the start build without delayed frees (c = 512, ubatch 512 and 64).
+
+## 5b. Correctness fix (2026-10-12, GitHub issue #1)
+
+Observation: a user running consecutive chat requests that share a prompt prefix saw `inconsistent sequence positions` in the
+MTP draft context on the first draft of every request, and `deferred catch-up failed`. Reproduced on the same Mac (9 errors in
+10 requests); the unmodified build, the fork without env vars and the fork without `LLAMA_SPEC_MTP_MERGE` gave 0.
+Cause: M8 (merged catch-up) deferred the catch-up of any small batch while a "generating" flag was set, and cleared the flag only
+in begin(), which the server calls after the prompt. The last few prompt tokens of a new request (split off for the recurrent
+checkpoint) are such a small batch, so the previous request's deferred rows were flushed into the draft context at their old
+positions. Change: only the verify batch of the last draft (it starts at that draft's pos0) is deferred; any other batch drops a
+pending deferral; a flush never writes rows that do not continue the draft context. Effect: 0 errors; the target output is
+unchanged (drafts are verified; the code text is identical); bench 4K, which repeats its prompts, 109.9 → 117.9 tok/s.
+
+## 6. Quality (2026-10-13, same Mac, greedy, thinking off)
+
+KL divergence against the start build's own ubatch-512 logits (wikitext-2, 40 x 512): ub 1 start 0.00748 / `-12a` 0.00742,
+ub 4 start 0.00690 / `-12a` 0.00693, top-1 agreement equal (97.28 % / 97.45 %), ub 512 bit-identical. Accuracy: GSM8K-200 97.0 % / 97.0 %,
+MGSM-ja-250 86.4 % / 86.4 %, GSM8K 4-turn conversations 98.5 % / 98.0 % (one question), at 1.4x the decode speed.
+The unmodified CUDA build on another GPU gives 97.0 % / 86.8 %.

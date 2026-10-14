@@ -1,7 +1,7 @@
 From 4ff6e89c30848093b2e2ee19d24428f58c73bf3b Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:50:33 +0900
-Subject: [PATCH 17/49] metal: GGML_METAL_PROF_DISPATCH dispatch-shape
+Subject: [PATCH 17/52] metal: GGML_METAL_PROF_DISPATCH dispatch-shape
  profiling
 
 ---
@@ -110,5 +110,5 @@ index 0a6441c..cc69ab4 100644
  
      // check if the current node can run concurrently with other nodes before it
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

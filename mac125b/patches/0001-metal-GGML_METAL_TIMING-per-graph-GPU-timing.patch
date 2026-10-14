@@ -1,7 +1,7 @@
 From 55a2f7a63fafca2cb41da3092ec882c7a6c0a0df Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 21:28:20 +0900
-Subject: [PATCH 01/49] metal: GGML_METAL_TIMING per-graph GPU timing
+Subject: [PATCH 01/52] metal: GGML_METAL_TIMING per-graph GPU timing
 
 ---
  ggml/src/ggml-metal/ggml-metal-context.m | 49 ++++++++++++++++++++++++
@@ -11,7 +11,7 @@ diff --git a/ggml/src/ggml-metal/ggml-metal-context.m b/ggml/src/ggml-metal/ggml
 index e906466..701c17d 100644
 --- a/ggml/src/ggml-metal/ggml-metal-context.m
 +++ b/ggml/src/ggml-metal/ggml-metal-context.m
-@@ -82,6 +82,12 @@
+@@ -82,6 +82,12 @@ struct ggml_metal {
      // error state - set when a command buffer fails during synchronize
      // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
      bool has_error;
@@ -96,5 +96,5 @@ index e906466..701c17d 100644
          //[ctx->cmd_buf_last waitUntilCompleted];
  
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

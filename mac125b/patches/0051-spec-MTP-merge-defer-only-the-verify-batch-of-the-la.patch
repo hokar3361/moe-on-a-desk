@@ -1,7 +1,7 @@
 From 12ea6b4b1d6d8f515f708ae461e0392894e2fe43 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Mon, 12 Oct 2026 09:03:11 +0900
-Subject: [PATCH 51/51] spec MTP merge: defer only the verify batch of the last
+Subject: [PATCH 51/52] spec MTP merge: defer only the verify batch of the last
  draft; drop stale deferred catch-up on any other batch (new prompt), never
  flush rows that do not continue the draft context (fixes inconsistent
  sequence positions with prompt-cache reuse)
@@ -78,5 +78,5 @@ index 73d9708..6d0ada7 100644
              batch.set_embd_state(idx, { pending_h[seq_id].data(), 1, (size_t) n_embd });
  
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

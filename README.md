@@ -52,9 +52,14 @@ fixed prompt each. The two comparison rows were measured once on the same machin
 | this work `-11d` (mean of 2 runs) | same | 98.4 | 98.8 | 107.0 | 65.9 |
 | this work `-11e` (mean of 2 runs) | same | 115.8 | 106.6 | 111.2 | 69.7 |
 | this work `-11f` (mean of 2 runs) | same | 125.8 | 109.7 | 110.3 | 70.9 |
-| **this work `-12a`** (mean of 3 runs) | same | **124.7** | **117.9** | **112.4** | **66.8** |
+| this work `-12a` (mean of 3 runs) | same | 124.7 | 117.9 | 112.4 | 66.8 |
+| **this work `-14a`** (mean of 2 runs) | same | **125.4** | **117.7** | **117.1** | **70.4** |
+| reference: Strata v0.1.44 + a 64 GB resident fix, MTP `--spec 2` | its own pack from the same IQ3_XXS GGUF | 73.5 | 72.3 | 69.5 | 59.3 |
 
-`-12a` is +62 / +57 / +47 / +38 % over the start. It fixes a draft-context bug with prompt-cache reuse
+`-14a` is +63 / +56 / +53 / +46 % over the start. It adds parallel page faults for the cold rows of the 27.5 GB n-gram table on macOS
+(llama.cpp's `llama_prefetch` had no Apple implementation): +11 % on never-seen prose, outputs unchanged (`mac125b/CONCLUSIONS.md` §0b).
+Strata (an independent engine with a different design, thanks to its author) was measured on the same Mac with the same file and metric;
+it is faster one token at a time, this fork at verify widths 2-8 (`mac125b/DESIGN.md` §11). `-12a` was +62 / +57 / +47 / +38 % over the start. It fixes a draft-context bug with prompt-cache reuse
 ([issue #1](https://github.com/hokar3361/moe-on-a-desk/issues/1)); bench 4K, which repeats its prompts, gains the most.
 Measured side by side in one session, `-11f` gave 126.2 / 109.9 / 116.5 / 68.3: code produced the same text, and
 code / prose single runs swing by ±10 % (the prose text itself varies between runs of the same build, see below). The other engines are listed as reference points on the same machine,

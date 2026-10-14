@@ -1,7 +1,7 @@
 From aff423f428733e82666c385ccbef905d74cd29c6 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:24:22 +0900
-Subject: [PATCH 09/49] metal: hc mix v5 + profiling bits
+Subject: [PATCH 09/52] metal: hc mix v5 + profiling bits
 
 ---
  ggml/src/ggml-metal/ggml-metal-ops.cpp |  2 +-
@@ -137,5 +137,5 @@ index 8902e39..f282538 100644
  
              float result = 0.0f;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

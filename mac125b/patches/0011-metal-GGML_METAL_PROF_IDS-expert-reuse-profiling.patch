@@ -1,7 +1,7 @@
 From bc228241984b2fcc3efdbb91d46953ccfcc51110 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:31:34 +0900
-Subject: [PATCH 11/49] metal: GGML_METAL_PROF_IDS expert reuse profiling
+Subject: [PATCH 11/52] metal: GGML_METAL_PROF_IDS expert reuse profiling
 
 ---
  ggml/src/ggml-metal/ggml-metal-context.m  |  4 ++
@@ -208,5 +208,5 @@ index f282538..541a933 100644
          constant ggml_metal_kargs_dsv4_hc_post & args,
          device const char * x,
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

@@ -1,7 +1,7 @@
 From 84c07cc142c2e15b2eecd5c9fb54dad50ae02e50 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:51:01 +0900
-Subject: [PATCH 18/49] metal: contiguous unary/binary kernels use 256-thread
+Subject: [PATCH 18/52] metal: contiguous unary/binary kernels use 256-thread
  threadgroups (were 1-thread)
 
 ---
@@ -71,5 +71,5 @@ index e50a648..bbf53a5 100644
          src0_ptr = (device const T0 *) (src0);
          dst_ptr  = (device       T  *) (dst);
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

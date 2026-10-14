@@ -1,7 +1,7 @@
 From 1c38e520b6602f2bdf1ab51673150b42e3c5b03b Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 20:41:27 +0900
-Subject: [PATCH 49/49] stop rule: lambda as a slow EMA (0.01/round, init
+Subject: [PATCH 49/52] stop rule: lambda as a slow EMA (0.01/round, init
  0.09); fix: HC_POST+norm fusion refuses outputs overlapping its inputs
  (without delayed frees the allocator reused the shared block output, ub>=64
  prefill PPL 1.23 -> 253); register/shuffle bitonic top-k (same network,
@@ -213,5 +213,5 @@ index 3d84be0..3fcbe5f 100644
      // top_k fills a short selection with invisible pools that can overlap the tail, so the scatter would write
      // some cells from several threads: map every dead slot to its own dump row, idx = dump + live*(idx - dump)
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

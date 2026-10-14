@@ -1,0 +1,69 @@
+From 12a3402172d27d678035ae2ebcd2359eadb4ce85 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Wed, 14 Oct 2026 08:27:45 +0900
+Subject: [PATCH 52/52] llama_prefetch on macOS: fault the pages of the
+ requested rows in concurrently (GCD), so the cold PLE n-gram table rows are
+ read with many SSD requests in flight; LLAMA_PREFETCH_TOUCH=0 turns it off
+
+---
+ src/llama-mmap.cpp | 43 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 43 insertions(+)
+
+diff --git a/src/llama-mmap.cpp b/src/llama-mmap.cpp
+index 045489d..deeabbc 100644
+--- a/src/llama-mmap.cpp
++++ b/src/llama-mmap.cpp
+@@ -834,7 +834,50 @@ const bool llama_mlock::SUPPORTED = true;
+ const bool llama_mlock::SUPPORTED = false;
+ #endif
+ 
++#if defined(__APPLE__)
++#include <dispatch/dispatch.h>
++
++static void llama_prefetch_touch_page(void * ctx, size_t i) {
++    const volatile char * p = ((const char * const *) ctx)[i];
++    (void) *p;
++}
++
++// fault the pages in concurrently; returns when they are resident
++static void llama_prefetch_apple(const llama_memory_ranges & mr) {
++    static const bool on = !getenv("LLAMA_PREFETCH_TOUCH") || atoi(getenv("LLAMA_PREFETCH_TOUCH")) != 0;
++    if (!on || mr.empty()) {
++        return;
++    }
++    static const size_t page = (size_t) sysconf(_SC_PAGESIZE);
++    std::vector<const char *> pages;
++    pages.reserve(mr.size());
++    for (const auto & range : mr) {
++        if (!range.addr || range.size == 0) {
++            continue;
++        }
++        const uintptr_t first = (uintptr_t) range.addr / page * page;
++        const uintptr_t last  = ((uintptr_t) range.addr + range.size - 1) / page * page;
++        for (uintptr_t a = first; a <= last; a += page) {
++            pages.push_back((const char *) a);
++        }
++    }
++    std::sort(pages.begin(), pages.end());
++    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
++    if (pages.size() <= 1) {
++        for (const char * a : pages) {
++            llama_prefetch_touch_page(&a, 0);
++        }
++        return;
++    }
++    dispatch_apply_f(pages.size(), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), pages.data(), llama_prefetch_touch_page);
++}
++#endif
++
+ void llama_prefetch(llama_memory_ranges mr) {
++#if defined(__APPLE__)
++    llama_prefetch_apple(mr);
++    return;
++#endif
+ #if defined(__linux__) || (defined(_WIN32) && _WIN32_WINNT >= 0x602)
+     if (mr.empty()) {
+         return;
+-- 
+2.53.0
+

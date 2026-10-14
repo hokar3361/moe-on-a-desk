@@ -1,7 +1,7 @@
 From 97e5be0292dcd155978c5998bde07284a1a03936 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 15:18:54 +0900
-Subject: [PATCH 37/49] metal: q4_K few-row MMA with a q4_K-specific decode
+Subject: [PATCH 37/52] metal: q4_K few-row MMA with a q4_K-specific decode
  (the q5_K kernel with the 5th bit 0); -22% per op at B=3..4, verify -1%
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -200,5 +200,5 @@ index 5cf245d..afea9a0 100644
  
  #if defined(GGML_METAL_HAS_BF16)
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

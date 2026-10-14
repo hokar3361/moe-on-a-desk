@@ -1,7 +1,7 @@
 From 1068559b56ba54ccdf943ff89a0c13ed9c214954 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 17:18:30 +0900
-Subject: [PATCH 42/49] metal: HC_POST (gated) + grouped RMS_NORM + gamma in
+Subject: [PATCH 42/52] metal: HC_POST (gated) + grouped RMS_NORM + gamma in
  one dispatch, same threads and reduction order as the norm kernel
  (bit-identical); barriers 1610 -> 1515, B=3 verify -0.37 ms
 
@@ -152,5 +152,5 @@ index 8856422..a49ac27 100644
 +    }
 +}
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

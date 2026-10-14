@@ -1,7 +1,7 @@
 From 99415bf2d7c7b91ebb8e001dead862b5b04f3157 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 23:24:07 +0900
-Subject: [PATCH 19/49] metal: grouped MoE matvec (opt-in, slower than stock),
+Subject: [PATCH 19/52] metal: grouped MoE matvec (opt-in, slower than stock),
  dispatch profiling with tensor names
 
 ---
@@ -282,5 +282,5 @@ index 9d77848..4aa5c28 100644
 +template [[host_name("kernel_mul_mv_id_grp_iq2_s")]]   kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_iq2_s,   16, dequantize_iq2_s>;
 +template [[host_name("kernel_mul_mv_id_grp_q2_0")]]    kernel kernel_mul_mv_id_grp_t kernel_mul_mv_id_grp<block_q2_0,    4,  dequantize_q2_0>;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

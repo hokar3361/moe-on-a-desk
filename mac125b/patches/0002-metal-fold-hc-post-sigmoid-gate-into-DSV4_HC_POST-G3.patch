@@ -1,7 +1,7 @@
 From c26719a3019881ed17ac93af711631c57c854b95 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 21:32:09 +0900
-Subject: [PATCH 02/49] metal: fold hc post sigmoid gate into DSV4_HC_POST (G3)
+Subject: [PATCH 02/52] metal: fold hc post sigmoid gate into DSV4_HC_POST (G3)
 
 ---
  ggml/src/ggml-metal/ggml-metal-fusion.cpp | 54 +++++++++++++++++++
@@ -213,5 +213,5 @@ index fb27983..71d712f 100644
  
      float post_reg[hc];
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

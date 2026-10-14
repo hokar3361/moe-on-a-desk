@@ -1,7 +1,7 @@
 From 47fdcfc1d275f719a698a98218dfcc0d15ceae83 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sun, 11 Oct 2026 09:55:38 +0900
-Subject: [PATCH 33/49] metal: profiling helpers (GGML_METAL_PROF_SKIPNAME by
+Subject: [PATCH 33/52] metal: profiling helpers (GGML_METAL_PROF_SKIPNAME by
  node name, absolute submit time in metal-timing)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -53,5 +53,5 @@ index 1272a94..9daf07b 100644
      if (!env) {
          return false;
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 

@@ -1,7 +1,7 @@
 From 6a7f04fe33be5cdc639b7bb8a5840023ec05ad43 Mon Sep 17 00:00:00 2001
 From: mac125b <mac125b@example.invalid>
 Date: Sat, 10 Oct 2026 22:42:54 +0900
-Subject: [PATCH 14/49] metal: GGML_METAL_PROF_NOTABLES profiling macro
+Subject: [PATCH 14/52] metal: GGML_METAL_PROF_NOTABLES profiling macro
 
 ---
  ggml/src/ggml-metal/ggml-metal-device.m  |  3 +++
@@ -94,5 +94,5 @@ index cf3a2ac..5f2eef4 100644
      //}
  
 -- 
-2.50.1 (Apple Git-155)
+2.53.0
 
