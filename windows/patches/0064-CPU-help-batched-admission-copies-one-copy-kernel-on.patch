@@ -1,0 +1,187 @@
+From 8a1207f46a8bc37523725057b2e8668aae508005 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Thu, 15 Oct 2026 20:38:15 +0900
+Subject: [PATCH] CPU help: batched admission copies (one copy kernel on the
+ second stream, ggml_backend_cuda_copy_list); GGML_CUDA_GRAPH_STATS
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu  | 27 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/moe-fetch.cu  | 20 ++++++++++++++++++
+ ggml/src/ggml-cuda/moe-fetch.cuh |  1 +
+ src/llama-moe-cache.cpp          | 36 +++++++++++++++++++++++++++++++-
+ 4 files changed, 83 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index eace44bd2..8e98cb32e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4942,6 +4942,23 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+     }
+ #endif // USE_CUDA_GRAPH
+ 
++    {
++        // fork: GGML_CUDA_GRAPH_STATS=N prints every N computes how many ran as a graph launch, as a new capture, or eagerly
++        static const int every = getenv("GGML_CUDA_GRAPH_STATS") ? atoi(getenv("GGML_CUDA_GRAPH_STATS")) : 0;
++        if (every > 0) {
++            static int n = 0, n_graph = 0, n_capture = 0, n_eager = 0;
++            n++;
++            if (use_cuda_graph && !cuda_graph_update_required) n_graph++;
++            else if (use_cuda_graph) n_capture++;
++            else n_eager++;
++            if (n % every == 0) {
++                GGML_LOG_WARN("cuda graph stats: %d computes: %d graph launches, %d captures, %d eager (%zu graphs kept)\n", n, n_graph, n_capture, n_eager,
++                        cuda_ctx->cuda_graphs.size());
++                n = n_graph = n_capture = n_eager = 0;
++            }
++        }
++    }
++
+     if (use_cuda_graph && cuda_graph_update_required) {
+         // Start CUDA graph capture
+         {
+@@ -5429,6 +5446,13 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
+ 
+ // the device address of page-locked host memory (registered with ggml_backend_cuda_register_host_buffer), nullptr if it has none
+ // (with WSL, the host address cannot be used by kernels: canUseHostPointerForRegisteredMem is 0)
++// fork: one copy kernel for a list of copies (see moe-fetch.cu), on the stream of this backend
++void ggml_backend_cuda_copy_list(ggml_backend_t backend, const void * list_dev, int n) {
++    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
++    ggml_cuda_set_device(ctx->device);
++    ggml_cuda_copy_list(ctx->stream(), list_dev, n);
++}
++
+ void * ggml_backend_cuda_host_buffer_device_ptr(void * buffer) {
+     void * dev = nullptr;
+     if (cudaHostGetDevicePointer(&dev, buffer, 0) != cudaSuccess) {
+@@ -6293,6 +6317,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
+     if (strcmp(name, "ggml_backend_host_buffer_device_ptr") == 0) {
+         return (void *)ggml_backend_cuda_host_buffer_device_ptr;
+     }
++    if (strcmp(name, "ggml_backend_copy_list") == 0) {
++        return (void *)ggml_backend_cuda_copy_list;
++    }
+     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
+         return (void *)ggml_backend_cuda_register_host_buffer;
+     }
+diff --git a/ggml/src/ggml-cuda/moe-fetch.cu b/ggml/src/ggml-cuda/moe-fetch.cu
+index 0bd6c204b..ce61965d8 100644
+--- a/ggml/src/ggml-cuda/moe-fetch.cu
++++ b/ggml/src/ggml-cuda/moe-fetch.cu
+@@ -461,6 +461,26 @@ static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu
+     }
+ }
+ 
++// a list of copies (src device address, dst device address, bytes, all multiples of 16), read from page-locked host memory
++struct moe_copy_entry { const uint4 * src; uint4 * dst; long long n16; };
++
++static __global__ void k_copy_list(const moe_copy_entry * __restrict__ list, const int n) {
++    for (int e = 0; e < n; ++e) {
++        const moe_copy_entry c = list[e];
++        for (long long u = (long long) blockIdx.x*blockDim.x + threadIdx.x; u < c.n16; u += (long long) gridDim.x*blockDim.x) {
++            c.dst[u] = c.src[u];
++        }
++    }
++}
++
++void ggml_cuda_copy_list(cudaStream_t stream, const void * list_dev, int n) {
++    if (n <= 0) {
++        return;
++    }
++    k_copy_list<<<FETCH_COPY_BLOCKS, 256, 0, stream>>>((const moe_copy_entry *) list_dev, n);
++    CUDA_CHECK(cudaGetLastError());
++}
++
+ void ggml_cuda_op_moe_cpu_recv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int32_t * p = (const int32_t *) dst->op_params;
+     ggml_moe_cpu_box * box = moe_cpu_box_ptr(p);
+diff --git a/ggml/src/ggml-cuda/moe-fetch.cuh b/ggml/src/ggml-cuda/moe-fetch.cuh
+index 9fe88cd7c..6e266fe4e 100644
+--- a/ggml/src/ggml-cuda/moe-fetch.cuh
++++ b/ggml/src/ggml-cuda/moe-fetch.cuh
+@@ -4,3 +4,4 @@
+ 
+ void ggml_cuda_op_moe_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ void ggml_cuda_op_moe_cpu_recv(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
++void ggml_cuda_copy_list(cudaStream_t stream, const void * list_dev, int n);
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index d000a552b..f3dc30c5f 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1088,6 +1088,15 @@ struct llama_moe_cache::impl {
+     std::vector<std::vector<uint8_t>> adm_lock; // [group][slot]: being written
+     std::vector<std::pair<int32_t, int32_t>> adm_want; // (il, e) of the CPU misses of the last forward
+     size_t f_admit = 0, f_admit_dup = 0;
++    // batched admission copies: the list lives in page-locked host memory the GPU reads (LLAMA_MOE_CPU_ADMIT_BATCH=0: memcpy each)
++    struct copy_entry { const void * src; void * dst; long long n16; };
++    typedef void (*copy_list_t)(ggml_backend_t, const void *, int);
++    copy_list_t adm_copy_list = nullptr;
++    ggml_backend_buffer_ptr adm_list_buf;
++    copy_entry * adm_list_host = nullptr;
++    void       * adm_list_dev  = nullptr;
++    int32_t      adm_list_cap  = 0;
++    std::vector<int64_t> f_desc_host; // [16*n_layer]: the device addresses of the page-locked host experts (see init_fetch)
+ 
+     void init_cpu(const llama_model & model) {
+         ggml_backend_dev_t dev = ggml_backend_get_device(devices[0].backend);
+@@ -1198,6 +1207,19 @@ struct llama_moe_cache::impl {
+                 adm_max = 0;
+             }
+         }
++        const bool batch = !getenv("LLAMA_MOE_CPU_ADMIT_BATCH") || atoi(getenv("LLAMA_MOE_CPU_ADMIT_BATCH")) != 0;
++        if (adm_max > 0 && batch) {
++            adm_copy_list = (copy_list_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_copy_list");
++            adm_list_cap  = adm_max*3;
++            adm_list_buf.reset(ggml_backend_buft_alloc_buffer(hbt, sizeof(copy_entry)*adm_list_cap));
++            if (adm_copy_list && adm_list_buf) {
++                adm_list_host = (copy_entry *) ggml_backend_buffer_get_base(adm_list_buf.get());
++                adm_list_dev  = dev_ptr(adm_list_host);
++            }
++            if (!adm_copy_list || !adm_list_dev || f_desc_host.empty()) {
++                adm_copy_list = nullptr;
++            }
++        }
+         LLAMA_LOG_WARN("%s: CPU help for the MoE cache misses: %d layers, %d threads, the first %d misses of a layer over PCIe, then up to %d jobs of experts with at most %d tokens%s\n", __func__,
+                 n_ok, cpu_threads, cpu_pcie, cpu_jobs, cpu_maxtok, (cpu_flags & GGML_MOE_CPU_VERIFY) ? ", VERIFY (all misses copied, the CPU results are compared)" : "");
+     }
+@@ -1255,6 +1277,7 @@ struct llama_moe_cache::impl {
+             }
+         }
+         ggml_backend_tensor_set(f_desc, desc.data(), 0, ggml_nbytes(f_desc));
++        f_desc_host = desc;
+ 
+         f_host.assign((size_t) f_row*layers.size(), 0);
+         f_pool_host.assign((size_t) (1 + f_pool)*groups.size(), 0);
+@@ -1451,6 +1474,7 @@ struct llama_moe_cache::impl {
+         // 2b. admission of the CPU misses of the last forward: each gets the least recently used slot that is not in a pool, the copy
+         //     runs by DMA on the second stream while the next forward computes; the slot is mapped at the next begin_forward
+         if (read && !adm_want.empty()) {
++            int32_t n_list = 0;
+             for (const auto & w : adm_want) {
+                 const int32_t il = w.first, e = w.second;
+                 const int32_t ig = layers[il].ig;
+@@ -1487,10 +1511,20 @@ struct llama_moe_cache::impl {
+                 const layer & l = layers[il];
+                 for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                     const size_t es = l.experts[ip]->nb[2];
+-                    ggml_backend_tensor_set_async(adm_backend, g.banks[ip], (const uint8_t *) l.experts[ip]->data + (size_t) e*es, (size_t) v*es, es);
++                    if (adm_copy_list && n_list < adm_list_cap && es % 16 == 0) {
++                        copy_entry & c = adm_list_host[n_list++];
++                        c.src = (const void *) (uintptr_t) (f_desc_host[16*il + 1 + 3*ip] + (int64_t) ((size_t) e*es));
++                        c.dst = (uint8_t *) g.banks[ip]->data + (size_t) v*es;
++                        c.n16 = (long long) (es/16);
++                    } else {
++                        ggml_backend_tensor_set_async(adm_backend, g.banks[ip], (const uint8_t *) l.experts[ip]->data + (size_t) e*es, (size_t) v*es, es);
++                    }
+                 }
+                 adm_pending.push_back({ ig, il, e, v });
+             }
++            if (n_list > 0) {
++                adm_copy_list(adm_backend, adm_list_dev, n_list);
++            }
+             if (!adm_pending.empty()) {
+                 ggml_backend_event_record(adm_event, adm_backend);
+             }
+-- 
+2.56.0.windows.2
+

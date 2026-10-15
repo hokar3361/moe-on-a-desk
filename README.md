@@ -39,6 +39,7 @@ IQ3_XXS GSQ-RCO file as the baseline, fully GPU resident — and all gains come 
 - `mac125b/patches/` — the fork as `git format-patch` output on upstream llama.cpp `781dbc5`
 - `mac125b/tools/` — measurement, verification, kernel micro-benchmarks, analysis, MTP training, a comparison console
 - `wsl/` — the Windows (WSL2) + NVIDIA edition: README, log, 3 more patches on top of `mac125b/patches`, tools
+- `windows/` — the native Windows + NVIDIA edition: README (Japanese), 7 more patches on top of `mac125b/patches` and `wsl/patches`, build / run / measure tools
 
 ## Tested on (the only machine so far)
 
@@ -146,6 +147,22 @@ cache size**, and the CPU stays at about 3 %. Details, caveats and the machine: 
 
 Outputs are identical to the unmodified build at the same draft depth. Prompt processing (180-270 tok/s) is not improved yet.
 
+## Windows (native) + RTX 4090 edition (2026-10-15)
+
+The same model and file on the same gaming PC, now as a **native Windows build** (no WSL), tuned for realistic single-user speed on
+that machine: the GPU-side MoE cache lookup of the WSL edition, a fused hyper-connection mix (`GGML_OP_HC_MIX`), graphs kept per
+small-batch shape, and asynchronous copies of the per-forward inputs (found with Nsight Systems: about 30 synchronous copies per
+forward kept the GPU waiting). Details, caveats, build and run steps: [`windows/README.md`](windows/README.md) (Japanese).
+
+| (native Windows, RTX 4090, fixed metric, mean of 2 runs) | bench 1K | bench 4K | code 400 | prose 400 | mean | CPU | VRAM |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| llama.cpp 781dbc5, unmodified, expert cache 14 GB, MTP Q8_0 depth 3 | 115.7 | 116.8 | 67.6 | 68.5 | 92.1 | 9 % | 23.4 GB |
+| **this work** (`windows/patches`, cache 14.6 GB, small MTP depth 3) | **151.8** | **149.4** | **97.9** | **93.4** | **123.1** | 12 % | 23.2 GB |
+| | +31 % | +28 % | +45 % | +36 % | **+35 %** (average of the four) | | |
+
+The code answer is identical to the unmodified build; the prose answer takes a different wording after 148 characters (the fused mix
+changes the summation order). Both rows were measured on the same day with the commands in `windows/README.md`. One PC only.
+
 ## How much the output quality has been checked (honestly: lightly)
 
 Checked:
@@ -230,7 +247,7 @@ Verify before trusting a build:
 ## Caveats
 
 - **One machine per platform.** The Mac results come from one Mac Studio (Metal); the CUDA results from one RTX 4090 PC under WSL2
-  (`wsl/`). On CUDA, apply `wsl/patches` too: without patch 0056 the Mac series crashes after about 256 tokens.
+  (`wsl/`) and natively on Windows (`windows/`, the same PC). On CUDA, apply `wsl/patches` too: without patch 0056 the Mac series crashes after about 256 tokens.
 - **Fixed bug.** Checkpoints `-11b` to `-11e` contain a fusion that corrupts prompt batches of ≥ 64 tokens when
   `GGML_ALLOC_FREE_DELAY` is not set (PPL 1.23 → 253 at ubatch 512). Every configuration measured here sets it, so the
   numbers stand, but use `-11f` or later.

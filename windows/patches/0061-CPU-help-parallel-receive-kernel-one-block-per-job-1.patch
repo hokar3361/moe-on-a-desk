@@ -1,0 +1,445 @@
+From 048780e681b5d0d496d539f2592d7e3435e1fabb Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Thu, 15 Oct 2026 19:33:33 +0900
+Subject: [PATCH] CPU help: parallel receive kernel (one block per job, 16-byte
+ loads), AVX2 multi-token down kernels for Q2_0 / IQ4_NL, GPU timing of copies
+ / span / plan
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h             |  10 ++
+ ggml/src/ggml-cuda/moe-fetch.cu | 101 ++++++++++++++-----
+ src/llama-moe-cache.cpp         | 173 +++++++++++++++++++++++++++++++-
+ 3 files changed, 258 insertions(+), 26 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 73bf50f12..db133a55b 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2771,6 +2771,16 @@ extern "C" {
+         uint32_t pad2;
+         int32_t  job_i[GGML_MOE_CPU_MAX_JOBS];   // index into the ids (k + n_used*token)
+         int32_t  job_e[GGML_MOE_CPU_MAX_JOBS];   // expert
++        uint64_t t_first;    // GPU timer at the plan of layer 0 of this forward
++        uint64_t t_lastplan; // GPU timer at the latest plan
++        uint64_t sum_span;   // sum over forwards of (last plan - first plan), ns (statistics)
++        uint32_t n_span;
++        uint32_t pad3;
++        uint64_t sum_copy_ns; // GPU time of the miss copies (first block start to last block end), summed (statistics)
++        uint64_t n_copy;      // experts copied
++        uint64_t sum_plan_ns; // plan kernel start to the bell, layers with jobs (statistics)
++        uint64_t sum_recv_ns; // receive kernel start to end, layers with jobs (statistics)
++        uint64_t n_plan;
+         // then at GGML_MOE_CPU_HDR: x [GGML_MOE_CPU_MAX_TOK][n_embd] f32, then d [GGML_MOE_CPU_MAX_JOBS][n_embd] f32
+     };
+     static inline size_t ggml_moe_cpu_box_size(int n_embd) {
+diff --git a/ggml/src/ggml-cuda/moe-fetch.cu b/ggml/src/ggml-cuda/moe-fetch.cu
+index a913d5cc9..bf7c20b78 100644
+--- a/ggml/src/ggml-cuda/moe-fetch.cu
++++ b/ggml/src/ggml-cuda/moe-fetch.cu
+@@ -20,6 +20,10 @@ static __device__ __forceinline__ uint64_t moe_globaltimer() {
+     return t;
+ }
+ 
++// statistics of the copies (folded into the box by the plan of layer 0 when the CPU help is on)
++static __device__ unsigned long long g_cp_t0, g_cp_ns, g_cp_n;
++static __device__ unsigned int g_cp_done;
++
+ struct moe_fetch_cpu_args {
+     bool                      on;
+     int                       zero_slot;
+@@ -38,6 +42,10 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+         int32_t * __restrict__ pool, const int n_expert, const int n_trace, const int tbase, const int n_trans, int32_t * __restrict__ out,
+         const bool fixed, const moe_fetch_cpu_args cpu) {
+     extern __shared__ int32_t shm[];
++    __shared__ uint64_t s_t0;
++    if (threadIdx.x == 0) {
++        s_t0 = moe_globaltimer();
++    }
+     int32_t * owner = shm;            // [n_expert]: smallest index of the ids that select the expert, then -2 - slot
+     int32_t * cnt   = shm + n_expert; // [n_expert]: number of ids that select the expert (CPU help only)
+     __shared__ int s_nt, s_nm, s_tr, s_nmo, s_nj;
+@@ -203,6 +211,21 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+     __syncthreads();
+     if (threadIdx.x == 0) {
+         volatile ggml_moe_cpu_box * b = cpu.box;
++        {
++            const uint64_t now = moe_globaltimer();
++            if (cpu.il == 0) {
++                b->sum_copy_ns = b->sum_copy_ns + g_cp_ns;
++                b->n_copy      = b->n_copy + g_cp_n;
++                g_cp_ns = 0;
++                g_cp_n  = 0;
++                if (b->t_first != 0 && b->t_lastplan > b->t_first) {
++                    b->sum_span = b->sum_span + (b->t_lastplan - b->t_first);
++                    b->n_span   = b->n_span + 1;
++                }
++                b->t_first = now;
++            }
++            b->t_lastplan = now;
++        }
+         b->il     = cpu.il;
+         b->n_jobs = nj;
+         b->n_tok  = cpu.n_tok;
+@@ -211,6 +234,8 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+         b->flags  = cpu.flags & GGML_MOE_CPU_VERIFY;
+         if (nj > 0) {
+             b->t_send = moe_globaltimer();
++            b->sum_plan_ns = b->sum_plan_ns + (b->t_send - s_t0);
++            b->n_plan      = b->n_plan + 1;
+             __threadfence_system();
+             b->req = b->req + 1;
+         }
+@@ -223,6 +248,9 @@ static __global__ void k_moe_fetch_copy(const int32_t * __restrict__ p_nm, const
+     if (n_miss == 0) {
+         return;
+     }
++    if (threadIdx.x == 0 && blockIdx.x == 0) {
++        g_cp_t0 = moe_globaltimer();
++    }
+     const int32_t * miss = p_nm + 1;
+     const int n_w = (int) desc[0];
+     // the 16-byte units of one expert over all its tensors
+@@ -244,6 +272,15 @@ static __global__ void k_moe_fetch_copy(const int32_t * __restrict__ p_nm, const
+         uint4       * dst = (uint4 *)       ((uint8_t *)       desc[3 + 3*w] + (int64_t) miss[2*m + 1]*size);
+         dst[r] = src[r];
+     }
++    __syncthreads();
++    if (threadIdx.x == 0) {
++        __threadfence();
++        if (atomicAdd(&g_cp_done, 1u) == gridDim.x - 1) {
++            g_cp_ns += moe_globaltimer() - g_cp_t0;
++            g_cp_n  += n_miss;
++            g_cp_done = 0;
++        }
++    }
+     // tails (sizes not a multiple of 16)
+     if (blockIdx.x == 0) {
+         for (int m = 0; m < n_miss; ++m) {
+@@ -281,7 +318,7 @@ void ggml_cuda_op_moe_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     if (cpu.on) {
+         cpu.zero_slot = p[5];
+         cpu.max_pcie  = p[6];
+-        cpu.max_jobs  = p[11] > 0 ? p[11] : GGML_MOE_CPU_MAX_JOBS;
++        cpu.max_jobs  = p[11] >= 0 ? p[11] : GGML_MOE_CPU_MAX_JOBS;
+         cpu.max_tok   = p[12] > 0 ? p[12] : GGML_MOE_CPU_MAX_TOK;
+         cpu.flags     = p[7];
+         cpu.box       = moe_cpu_box_ptr(p + 8);
+@@ -308,56 +345,69 @@ void ggml_cuda_op_moe_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
+-// waits for the CPU worker, then adds its rows (or, GGML_MOE_CPU_VERIFY, compares them with the GPU's)
++// waits for the CPU worker, then adds its rows (or, GGML_MOE_CPU_VERIFY, compares them with the GPU's).
++// One block per possible job (blockIdx.y): blocks past the job count leave after one read of the header; the others wait for the
++// acknowledgement, read their job's index once and add the row with 16-byte loads (the rows are in page-locked host memory, so
++// every load crosses PCIe: they are issued together, not one after another).
+ static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu_box * box, const int verify) {
+-    __shared__ int   s_go;
++    __shared__ int   s_go, s_i, s_nj, s_ne;
+     __shared__ float s_dmax[32], s_gmax[32];
+     volatile ggml_moe_cpu_box * b = box;
++    const int j = blockIdx.y;
+     if (threadIdx.x == 0) {
+         s_go = 0;
+         const int nj = b->n_jobs;
+-        if (nj > 0) {
++        s_nj = nj;
++        if (j < nj) {
+             const uint32_t want = b->req;
+             const long long t0 = clock64();
+             const uint64_t g0 = moe_globaltimer();
+             for (;;) {
+                 if (b->ack == want) {
+                     s_go = 1;
+-                    const uint64_t g1 = moe_globaltimer();
+-                    b->sum_window = b->sum_window + (g0 - b->t_send);
+-                    b->sum_wait   = b->sum_wait + (g1 - g0);
+-                    b->n_wait     = b->n_wait + 1;
++                    if (j == 0) {
++                        const uint64_t g1 = moe_globaltimer();
++                        b->sum_window = b->sum_window + (g0 - b->t_send);
++                        b->sum_wait   = b->sum_wait + (g1 - g0);
++                        b->n_wait     = b->n_wait + 1;
++                    }
+                     break;
+                 }
+                 // about 1-2 s at the GPU clock: never hang the GPU (Windows resets the driver after 2 s)
+                 if (clock64() - t0 > 2000000000LL) {
+-                    b->flags = b->flags | GGML_MOE_CPU_TIMEOUT;
++                    if (j == 0) {
++                        b->flags = b->flags | GGML_MOE_CPU_TIMEOUT;
++                    }
+                     break;
+                 }
+                 __nanosleep(200);
+             }
++            if (s_go) {
++                __threadfence_system();
++                s_i  = b->job_i[j];
++                s_ne = b->n_embd;
++            }
+         }
+-        __threadfence_system();
+     }
+     __syncthreads();
+     if (!s_go) {
+         return;
+     }
+-    const int nj     = b->n_jobs;
+-    const int n_embd = b->n_embd;
++    const int n_embd = s_ne;
+     const float * d  = (const float *) ((const char *) box + GGML_MOE_CPU_HDR) + (size_t) GGML_MOE_CPU_MAX_TOK*n_embd;
++    float       * row = experts + (size_t) s_i*n_embd;
++    const float * src = d + (size_t) j*n_embd;
+     float dmax = 0.0f, gmax = 0.0f;
+-    for (int j = 0; j < nj; ++j) {
+-        const int i = b->job_i[j];
+-        float       * row = experts + (size_t) i*n_embd;
+-        const float * src = d + (size_t) j*n_embd;
+-        for (int c = threadIdx.x; c < n_embd; c += blockDim.x) {
+-            if (verify) {
+-                dmax = fmaxf(dmax, fabsf(row[c] - src[c]));
+-                gmax = fmaxf(gmax, fabsf(row[c]));
+-            } else {
+-                row[c] += src[c];
+-            }
++    // n_embd is a multiple of 4 for the models this is used with; rows of the box are 16-byte aligned (n_embd*4 bytes each)
++    for (int c4 = blockIdx.x*blockDim.x + threadIdx.x; c4 < n_embd/4; c4 += gridDim.x*blockDim.x) {
++        const float4 v = ((const float4 *) src)[c4];
++        float4 r = ((float4 *) row)[c4];
++        if (verify) {
++            dmax = fmaxf(dmax, fmaxf(fmaxf(fabsf(r.x - v.x), fabsf(r.y - v.y)), fmaxf(fabsf(r.z - v.z), fabsf(r.w - v.w))));
++            gmax = fmaxf(gmax, fmaxf(fmaxf(fabsf(r.x), fabsf(r.y)), fmaxf(fabsf(r.z), fabsf(r.w))));
++        } else {
++            r.x += v.x; r.y += v.y; r.z += v.z; r.w += v.w;
++            ((float4 *) row)[c4] = r;
+         }
+     }
+     if (!verify) {
+@@ -389,7 +439,8 @@ static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu
+ void ggml_cuda_op_moe_cpu_recv(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const int32_t * p = (const int32_t *) dst->op_params;
+     ggml_moe_cpu_box * box = moe_cpu_box_ptr(p);
+-    // in place: dst is a view of the expert outputs
+-    k_moe_cpu_recv<<<1, 1024, 0, ctx.stream()>>>((float *) dst->data, box, p[2] & GGML_MOE_CPU_VERIFY);
++    // in place: dst is a view of the expert outputs [n_embd, n_used, n_tokens]: one block column per possible job
++    const int n_jobs_max = (int) std::min<int64_t>(dst->ne[1]*dst->ne[2], GGML_MOE_CPU_MAX_JOBS);
++    k_moe_cpu_recv<<<dim3(1, n_jobs_max), 256, 0, ctx.stream()>>>((float *) dst->data, box, p[2] & GGML_MOE_CPU_VERIFY);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 3275dfd0d..d0d18e863 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -37,6 +37,120 @@
+ 
+ namespace {
+ 
++// --- AVX2 down kernels for the CPU help (x86-64 only; checked at run time) ---
++#if defined(_M_X64) || defined(__x86_64__)
++#define MOE_CPU_X86 1
++#ifdef _MSC_VER
++#include <intrin.h>
++#else
++#include <cpuid.h>
++#endif
++static bool moe_cpu_has_avx2() {
++    static const bool ok = [] {
++#ifdef _MSC_VER
++        int r[4];
++        __cpuid(r, 0);
++        if (r[0] < 7) return false;
++        __cpuidex(r, 7, 0);
++        const bool avx2 = (r[1] >> 5) & 1;
++        __cpuid(r, 1);
++        const bool f16c = (r[2] >> 29) & 1, fma = (r[2] >> 12) & 1;
++        return avx2 && f16c && fma;
++#else
++        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma") && __builtin_cpu_supports("f16c");
++#endif
++    }();
++    return ok;
++}
++
++struct moe_bq8 { uint16_t d; int8_t  qs[32]; };   // block_q8_0
++struct moe_bq2 { uint16_t d; uint8_t qs[16]; };   // block_q2_0 (64 weights, 2 bits, value q - 1)
++struct moe_bi4 { uint16_t d; uint8_t qs[16]; };   // block_iq4_nl (32 weights)
++static_assert(sizeof(moe_bq8) == 34 && sizeof(moe_bq2) == 18 && sizeof(moe_bi4) == 18, "block layouts");
++
++#if defined(__GNUC__) || defined(__clang__)
++#define MOE_AVX2 __attribute__((target("avx2,fma,f16c")))
++#else
++#define MOE_AVX2
++#endif
++
++static inline MOE_AVX2 float moe_hsum8(__m256 v) {
++    __m128 a = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
++    a = _mm_add_ps(a, _mm_movehl_ps(a, a));
++    a = _mm_add_ss(a, _mm_movehdup_ps(a));
++    return _mm_cvtss_f32(a);
++}
++
++// rows [r0, r1) of a Q2_0 matrix (nb1 bytes per row, nblk blocks of 64) times T Q8_0 vectors y[t] (2*nblk blocks each);
++// yd[t][b] = scale of y block b, ys[t][b] = sum of its quants (the "-1" of every weight); out[t][r]
++static MOE_AVX2 void moe_down_q2_0(const uint8_t * w, size_t nb1, int64_t r0, int64_t r1, int nblk, int T,
++        const moe_bq8 * const * y, const float * const * yd, const int * const * ys, float * const * out) {
++    const __m256i idx0 = _mm256_setr_epi8(0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3, 4,4,4,4,5,5,5,5,6,6,6,6,7,7,7,7);
++    const __m256i idx1 = _mm256_add_epi8(idx0, _mm256_set1_epi8(8));
++    const __m256i M0 = _mm256_set1_epi32(0x00000003), M1 = _mm256_set1_epi32(0x00000300);
++    const __m256i M2 = _mm256_set1_epi32(0x00030000), M3 = _mm256_set1_epi32(0x03000000);
++    const __m256i ones = _mm256_set1_epi16(1);
++    for (int64_t r = r0; r < r1; ++r) {
++        const moe_bq2 * x = (const moe_bq2 *) (w + r*nb1);
++        __m256 acc[8];
++        float corr[8];
++        for (int t = 0; t < T; ++t) { acc[t] = _mm256_setzero_ps(); corr[t] = 0.0f; }
++        for (int b = 0; b < nblk; ++b) {
++            const __m256i qq = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i *) x[b].qs));
++            __m256i dk[2];
++            for (int k = 0; k < 2; ++k) {
++                const __m256i rep = _mm256_shuffle_epi8(qq, k ? idx1 : idx0);
++                dk[k] = _mm256_or_si256(
++                        _mm256_or_si256(_mm256_and_si256(rep, M0), _mm256_and_si256(_mm256_srli_epi32(rep, 2), M1)),
++                        _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi32(rep, 4), M2), _mm256_and_si256(_mm256_srli_epi32(rep, 6), M3)));
++            }
++            const float d0 = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
++            for (int t = 0; t < T; ++t) {
++                const moe_bq8 * yb = y[t] + 2*b;
++                const __m256i p0 = _mm256_madd_epi16(_mm256_maddubs_epi16(dk[0], _mm256_loadu_si256((const __m256i *) yb[0].qs)), ones);
++                const __m256i p1 = _mm256_madd_epi16(_mm256_maddubs_epi16(dk[1], _mm256_loadu_si256((const __m256i *) yb[1].qs)), ones);
++                const float s0 = d0*yd[t][2*b], s1 = d0*yd[t][2*b + 1];
++                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(s0), _mm256_cvtepi32_ps(p0), acc[t]);
++                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(s1), _mm256_cvtepi32_ps(p1), acc[t]);
++                corr[t] -= s0*(float) ys[t][2*b] + s1*(float) ys[t][2*b + 1];
++            }
++        }
++        for (int t = 0; t < T; ++t) {
++            out[t][r] = moe_hsum8(acc[t]) + corr[t];
++        }
++    }
++}
++
++// rows [r0, r1) of an IQ4_NL matrix (nblk blocks of 32) times T Q8_0 vectors
++static MOE_AVX2 void moe_down_iq4_nl(const uint8_t * w, size_t nb1, int64_t r0, int64_t r1, int nblk, int T,
++        const moe_bq8 * const * y, const float * const * yd, float * const * out) {
++    static const int8_t kv[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
++    const __m128i values128 = _mm_loadu_si128((const __m128i *) kv);
++    const __m128i m4b = _mm_set1_epi8(0x0f);
++    const __m256i ones = _mm256_set1_epi16(1);
++    for (int64_t r = r0; r < r1; ++r) {
++        const moe_bi4 * x = (const moe_bi4 *) (w + r*nb1);
++        __m256 acc[8];
++        for (int t = 0; t < T; ++t) acc[t] = _mm256_setzero_ps();
++        for (int b = 0; b < nblk; ++b) {
++            const __m128i q4 = _mm_loadu_si128((const __m128i *) x[b].qs);
++            const __m256i v = _mm256_set_m128i(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4, 4), m4b)),
++                                               _mm_shuffle_epi8(values128, _mm_and_si128(q4, m4b)));
++            const __m256i av = _mm256_sign_epi8(v, v);
++            const float d0 = _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(x[b].d)));
++            for (int t = 0; t < T; ++t) {
++                const __m256i yv = _mm256_loadu_si256((const __m256i *) y[t][b].qs);
++                const __m256i p = _mm256_madd_epi16(_mm256_maddubs_epi16(av, _mm256_sign_epi8(yv, v)), ones);
++                acc[t] = _mm256_fmadd_ps(_mm256_set1_ps(d0*yd[t][b]), _mm256_cvtepi32_ps(p), acc[t]);
++            }
++        }
++        for (int t = 0; t < T; ++t) {
++            out[t][r] = moe_hsum8(acc[t]);
++        }
++    }
++}
++#endif
++
+ // CPU help (LLAMA_MOE_CPU=1): computes the experts the GPU left to the CPU (see ggml_moe_fetch_set_cpu in ggml.h).
+ // One master thread watches the bell of the box; the master and its helpers split the rows of the gate/up and down matrices of the
+ // jobs' experts. Weights are read from the (page-locked) host experts with the CPU backend's dot products, the activations are
+@@ -76,6 +190,8 @@ struct moe_cpu_worker {
+     std::vector<uint8_t> xq[2];    // quantized x per token, gate/up dot types
+     std::vector<float> gu;         // [n_jobs][2][n_ff]
+     std::vector<uint8_t> hq;       // [n_jobs] quantized activations for down
++    std::vector<float> hyd;        // [n_jobs][n_ff/32] scales of hq's blocks (own down kernels)
++    std::vector<int>   hys;        // [n_jobs][n_ff/32] sums of hq's quants
+     size_t xq_row[2] = {0, 0}, hq_row = 0;
+ 
+     // stats
+@@ -318,6 +434,50 @@ struct moe_cpu_worker {
+         // down: items are (expert, block of rows), written to the box
+         const int RD = 64;
+         const int nb_e = (int) ((n_embd + RD - 1)/RD);
++#ifdef MOE_CPU_X86
++        // our AVX2 kernels: every weight block decoded once per row for all the tokens of the expert
++        static const bool own_down = moe_cpu_has_avx2() && !(getenv("LLAMA_MOE_CPU_GGML_DOWN") && atoi(getenv("LLAMA_MOE_CPU_GGML_DOWN")) != 0);
++        const bool q2 = L.type[2] == GGML_TYPE_Q2_0, i4 = L.type[2] == GGML_TYPE_IQ4_NL;
++        if (own_down && vtd == GGML_TYPE_Q8_0 && (q2 || i4) && n_ff % 64 == 0) {
++            const int nq8 = (int) (n_ff/32);
++            hyd.resize((size_t) n_jobs*nq8);
++            hys.resize((size_t) n_jobs*nq8);
++            for (int j = 0; j < n_jobs; ++j) {
++                const moe_bq8 * yb = (const moe_bq8 *) (hq.data() + hq_row*j);
++                for (int b = 0; b < nq8; ++b) {
++                    hyd[(size_t) j*nq8 + b] = ggml_fp16_to_fp32(yb[b].d);
++                    int s = 0;
++                    for (int q = 0; q < 32; ++q) s += yb[b].qs[q];
++                    hys[(size_t) j*nq8 + b] = s;
++                }
++            }
++            run_parallel((int) ex.size()*nb_e, [&](int it) {
++                const int g  = it / nb_e;
++                const int rb = it % nb_e;
++                const expert_jobs & E = ex[g];
++                const uint8_t * w = L.w[2] + (size_t) E.e*L.nb2[2];
++                const int64_t r0 = (int64_t) rb*RD, r1 = std::min<int64_t>(n_embd, (int64_t) (rb + 1)*RD);
++                for (int q0 = 0; q0 < E.n; q0 += 8) {
++                    const int T = std::min(8, E.n - q0);
++                    const moe_bq8 * yy[8]; const float * yd[8]; const int * ys[8]; float * oo[8];
++                    for (int t = 0; t < T; ++t) {
++                        const int j = E.j[q0 + t];
++                        yy[t] = (const moe_bq8 *) (hq.data() + hq_row*j);
++                        yd[t] = &hyd[(size_t) j*nq8];
++                        ys[t] = &hys[(size_t) j*nq8];
++                        oo[t] = d + (size_t) j*n_embd;
++                    }
++                    if (q2) {
++                        moe_down_q2_0(w, L.nb1[2], r0, r1, (int) (n_ff/64), T, yy, yd, ys, oo);
++                    } else {
++                        moe_down_iq4_nl(w, L.nb1[2], r0, r1, (int) (n_ff/32), T, yy, yd, oo);
++                    }
++                }
++            });
++            lap(3);
++            return;
++        }
++#endif
+         run_parallel((int) ex.size()*nb_e, [&](int it) {
+             const int g  = it / nb_e;
+             const int rb = it % nb_e;
+@@ -575,7 +735,7 @@ struct llama_moe_cache::impl {
+             cpu_pcie = std::max(0, atoi(getenv("LLAMA_MOE_CPU_PCIE")));
+         }
+         if (getenv("LLAMA_MOE_CPU_JOBS")) {
+-            cpu_jobs = std::max(1, atoi(getenv("LLAMA_MOE_CPU_JOBS")));
++            cpu_jobs = std::max(0, atoi(getenv("LLAMA_MOE_CPU_JOBS"))); // 0: no CPU jobs (the path's own cost, for measurement)
+         }
+         if (getenv("LLAMA_MOE_CPU_MAXTOK")) {
+             cpu_maxtok = std::max(1, atoi(getenv("LLAMA_MOE_CPU_MAXTOK")));
+@@ -1345,6 +1505,17 @@ struct llama_moe_cache::impl {
+                     LLAMA_LOG_WARN("moe_cache_cpu: GPU side: %u receives, window %.1f us, wait %.1f us per receive\n", nw,
+                             nw ? cpu_box->sum_window/1000.0/nw : 0.0, nw ? cpu_box->sum_wait/1000.0/nw : 0.0);
+                     cpu_box->sum_window = 0; cpu_box->sum_wait = 0; cpu_box->n_wait = 0;
++                    const uint32_t ns = cpu_box->n_span;
++                    LLAMA_LOG_WARN("moe_cache_cpu: GPU span of a forward (layer 0 to the last layer's lookup) %.2f ms over %u forwards\n",
++                            ns ? cpu_box->sum_span/1e6/ns : 0.0, ns);
++                    cpu_box->sum_span = 0; cpu_box->n_span = 0;
++                    LLAMA_LOG_WARN("moe_cache_cpu: miss copies on the GPU: %llu experts, %.1f us per expert\n", (unsigned long long) cpu_box->n_copy,
++                            cpu_box->n_copy ? cpu_box->sum_copy_ns/1000.0/cpu_box->n_copy : 0.0);
++                    cpu_box->sum_copy_ns = 0; cpu_box->n_copy = 0;
++                    LLAMA_LOG_WARN("moe_cache_cpu: plan %.1f us, receive %.1f us per layer with jobs (%llu)\n",
++                            cpu_box->n_plan ? cpu_box->sum_plan_ns/1000.0/cpu_box->n_plan : 0.0, cpu_box->n_plan ? cpu_box->sum_recv_ns/1000.0/cpu_box->n_plan : 0.0,
++                            (unsigned long long) cpu_box->n_plan);
++                    cpu_box->sum_plan_ns = 0; cpu_box->sum_recv_ns = 0; cpu_box->n_plan = 0;
+                 }
+                 uint64_t tt[4];
+                 for (int k = 0; k < 4; ++k) {
+-- 
+2.56.0.windows.2
+

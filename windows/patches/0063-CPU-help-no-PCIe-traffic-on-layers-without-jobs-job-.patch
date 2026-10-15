@@ -1,0 +1,210 @@
+From dcae3a351132cac3530655330e8a421047940653 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Thu, 15 Oct 2026 20:11:27 +0900
+Subject: [PATCH 2/2] CPU help: no PCIe traffic on layers without jobs (job
+ count and bell sequence in the fetch state row, device memory); GPU-side
+ statistics only with LLAMA_MOE_CACHE_LOG
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h             |  6 ++--
+ ggml/src/ggml-cuda/moe-fetch.cu | 57 ++++++++++++++++++++++++---------
+ ggml/src/ggml.c                 |  9 +++++-
+ src/llama-moe-cache.cpp         |  3 ++
+ 4 files changed, 57 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index ab914be91..ab05eb612 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2739,9 +2739,10 @@ extern "C" {
+             int                   transient_base,
+             int                   n_transient);
+ 
+-    // number of I32 in a state row: slot map [n_expert], n_trace, trace [2*n_trace], n_miss, miss [2*n_trace]
++    // number of I32 in a state row: slot map [n_expert], n_trace, trace [2*n_trace], n_miss, miss [2*n_trace],
++    // then (CPU help) the jobs of this layer's lookup and the bell's sequence number, both in device memory
+     static inline int ggml_moe_fetch_state_size(int n_expert, int n_trace) {
+-        return n_expert + 1 + 2*n_trace + 1 + 2*n_trace;
++        return n_expert + 1 + 2*n_trace + 1 + 2*n_trace + 2;
+     }
+ 
+     // MoE expert cache with CPU help (fork, CUDA only). The fetch of a layer may leave some of its misses to a CPU worker instead of
+@@ -2758,6 +2759,7 @@ extern "C" {
+ #define GGML_MOE_CPU_HDR       4096
+ #define GGML_MOE_CPU_VERIFY    1
+ #define GGML_MOE_CPU_TIMEOUT   2   // set by the GPU in the box when it stopped waiting for the CPU (the CPU rows are then left out)
++#define GGML_MOE_CPU_STATS     4   // flag: keep the GPU-side timing statistics in the box (costs host-memory accesses on every layer)
+     struct ggml_moe_cpu_box {
+         uint32_t req;        uint32_t pad0[15];
+         uint32_t ack;        uint32_t pad1[15];
+diff --git a/ggml/src/ggml-cuda/moe-fetch.cu b/ggml/src/ggml-cuda/moe-fetch.cu
+index bf7c20b78..0bd6c204b 100644
+--- a/ggml/src/ggml-cuda/moe-fetch.cu
++++ b/ggml/src/ggml-cuda/moe-fetch.cu
+@@ -207,11 +207,35 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+             bx[k] = cpu.x[k];
+         }
+     }
++    int32_t * dev_jobs = st + n_expert + 1 + 2*n_trace + 1 + 2*n_trace; // [0] jobs, [1] bell sequence
++    if (nj == 0) {
++        // no job: nothing crosses PCIe
++        if (threadIdx.x == 0) {
++            dev_jobs[0] = 0;
++            if (cpu.flags & GGML_MOE_CPU_STATS) {
++                volatile ggml_moe_cpu_box * b = cpu.box;
++                const uint64_t now = moe_globaltimer();
++                if (cpu.il == 0) {
++                    b->sum_copy_ns = b->sum_copy_ns + g_cp_ns;
++                    b->n_copy      = b->n_copy + g_cp_n;
++                    g_cp_ns = 0;
++                    g_cp_n  = 0;
++                    if (b->t_first != 0 && b->t_lastplan > b->t_first) {
++                        b->sum_span = b->sum_span + (b->t_lastplan - b->t_first);
++                        b->n_span   = b->n_span + 1;
++                    }
++                    b->t_first = now;
++                }
++                b->t_lastplan = now;
++            }
++        }
++        return;
++    }
+     __threadfence_system();
+     __syncthreads();
+     if (threadIdx.x == 0) {
+         volatile ggml_moe_cpu_box * b = cpu.box;
+-        {
++        if (cpu.flags & GGML_MOE_CPU_STATS) {
+             const uint64_t now = moe_globaltimer();
+             if (cpu.il == 0) {
+                 b->sum_copy_ns = b->sum_copy_ns + g_cp_ns;
+@@ -225,21 +249,21 @@ static __global__ void k_moe_fetch_plan(const int32_t * __restrict__ ids, const
+                 b->t_first = now;
+             }
+             b->t_lastplan = now;
++            b->t_send = now;
++            b->sum_plan_ns = b->sum_plan_ns + (now - s_t0);
++            b->n_plan      = b->n_plan + 1;
+         }
++        const uint32_t seq = (uint32_t) dev_jobs[1] + 1;
++        dev_jobs[0] = nj;
++        dev_jobs[1] = (int32_t) seq;
+         b->il     = cpu.il;
+         b->n_jobs = nj;
+         b->n_tok  = cpu.n_tok;
+         b->n_used = n_ids / cpu.n_tok;
+         b->n_embd = cpu.n_embd;
+         b->flags  = cpu.flags & GGML_MOE_CPU_VERIFY;
+-        if (nj > 0) {
+-            b->t_send = moe_globaltimer();
+-            b->sum_plan_ns = b->sum_plan_ns + (b->t_send - s_t0);
+-            b->n_plan      = b->n_plan + 1;
+-            __threadfence_system();
+-            b->req = b->req + 1;
+-        }
+         __threadfence_system();
++        b->req = seq;
+     }
+ }
+ 
+@@ -349,23 +373,24 @@ void ggml_cuda_op_moe_fetch(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+ // One block per possible job (blockIdx.y): blocks past the job count leave after one read of the header; the others wait for the
+ // acknowledgement, read their job's index once and add the row with 16-byte loads (the rows are in page-locked host memory, so
+ // every load crosses PCIe: they are issued together, not one after another).
+-static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu_box * box, const int verify) {
++static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu_box * box, const int32_t * __restrict__ dev_jobs,
++        const int verify, const int stats, const int n_embd) {
+     __shared__ int   s_go, s_i, s_nj, s_ne;
+     __shared__ float s_dmax[32], s_gmax[32];
+     volatile ggml_moe_cpu_box * b = box;
+     const int j = blockIdx.y;
+     if (threadIdx.x == 0) {
+         s_go = 0;
+-        const int nj = b->n_jobs;
++        const int nj = dev_jobs[0];
+         s_nj = nj;
+         if (j < nj) {
+-            const uint32_t want = b->req;
++            const uint32_t want = (uint32_t) dev_jobs[1];
+             const long long t0 = clock64();
+             const uint64_t g0 = moe_globaltimer();
+             for (;;) {
+                 if (b->ack == want) {
+                     s_go = 1;
+-                    if (j == 0) {
++                    if (j == 0 && stats) {
+                         const uint64_t g1 = moe_globaltimer();
+                         b->sum_window = b->sum_window + (g0 - b->t_send);
+                         b->sum_wait   = b->sum_wait + (g1 - g0);
+@@ -385,7 +410,7 @@ static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu
+             if (s_go) {
+                 __threadfence_system();
+                 s_i  = b->job_i[j];
+-                s_ne = b->n_embd;
++                s_ne = n_embd;
+             }
+         }
+     }
+@@ -393,7 +418,7 @@ static __global__ void k_moe_cpu_recv(float * __restrict__ experts, ggml_moe_cpu
+     if (!s_go) {
+         return;
+     }
+-    const int n_embd = s_ne;
++    // n_embd: kernel argument
+     const float * d  = (const float *) ((const char *) box + GGML_MOE_CPU_HDR) + (size_t) GGML_MOE_CPU_MAX_TOK*n_embd;
+     float       * row = experts + (size_t) s_i*n_embd;
+     const float * src = d + (size_t) j*n_embd;
+@@ -441,6 +466,8 @@ void ggml_cuda_op_moe_cpu_recv(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+     ggml_moe_cpu_box * box = moe_cpu_box_ptr(p);
+     // in place: dst is a view of the expert outputs [n_embd, n_used, n_tokens]: one block column per possible job
+     const int n_jobs_max = (int) std::min<int64_t>(dst->ne[1]*dst->ne[2], GGML_MOE_CPU_MAX_JOBS);
+-    k_moe_cpu_recv<<<dim3(1, n_jobs_max), 256, 0, ctx.stream()>>>((float *) dst->data, box, p[2] & GGML_MOE_CPU_VERIFY);
++    const int32_t * dev_jobs = (const int32_t *) dst->src[2]->data + p[3];
++    k_moe_cpu_recv<<<dim3(1, n_jobs_max), 256, 0, ctx.stream()>>>((float *) dst->data, box, dev_jobs, p[2] & GGML_MOE_CPU_VERIFY,
++            (p[2] & GGML_MOE_CPU_STATS) != 0, (int) dst->ne[0]);
+     CUDA_CHECK(cudaGetLastError());
+ }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 634c1af3d..0e9c5da22 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6672,13 +6672,20 @@ struct ggml_tensor * ggml_moe_cpu_recv(
+     // in place: only the rows the CPU computed change
+     struct ggml_tensor * result = ggml_view_tensor(ctx, experts);
+ 
++    // the job count and the bell's sequence number are at the end of the fetch's state row (device memory)
++    struct ggml_tensor * fetch = slots->op == GGML_OP_MOE_FETCH ? slots : slots->view_src;
++    GGML_ASSERT(fetch && fetch->op == GGML_OP_MOE_FETCH);
++    const int32_t * fp = (const int32_t *) fetch->op_params;
++    const int32_t i_jobs = ggml_moe_fetch_state_size(fp[0], fp[1]) - 2;
++
+     const uint64_t b = (uint64_t) (uintptr_t) box;
+-    const int32_t params[] = { (int32_t) (b & 0xffffffffu), (int32_t) (b >> 32), flags };
++    const int32_t params[] = { (int32_t) (b & 0xffffffffu), (int32_t) (b >> 32), flags, i_jobs };
+     ggml_set_op_params(result, params, sizeof(params));
+ 
+     result->op     = GGML_OP_MOE_CPU_RECV;
+     result->src[0] = experts;
+     result->src[1] = slots;
++    result->src[2] = fetch->src[1];
+ 
+     return result;
+ }
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 1385e667c..d000a552b 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -743,6 +743,9 @@ struct llama_moe_cache::impl {
+         if (getenv("LLAMA_MOE_CPU_VERIFY") && atoi(getenv("LLAMA_MOE_CPU_VERIFY")) != 0) {
+             cpu_flags |= GGML_MOE_CPU_VERIFY;
+         }
++        if (getenv("LLAMA_MOE_CACHE_LOG") && atoi(getenv("LLAMA_MOE_CACHE_LOG")) > 0) {
++            cpu_flags |= GGML_MOE_CPU_STATS;
++        }
+         if (model.hparams.n_expert == 0 || n_expert_used == 0) {
+             throw std::runtime_error("MoE cache requires a MoE model");
+         }
+-- 
+2.56.0.windows.2
+

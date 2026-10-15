@@ -1,0 +1,456 @@
+From 523b675db9781635aa3bdc9fd709e32d6f285466 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Thu, 15 Oct 2026 21:41:12 +0900
+Subject: [PATCH] Async split input copies (GGML_SCHED_ASYNC_INPUTS), NVTX host
+ ranges, pmin_auto rev2 (cut), graph update diagnostics
+
+Prose (p-min 0.7 diagnostic config) 88.6 -> 91.8 tok/s smoke, outputs identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ common/CMakeLists.txt           |  8 ++++
+ common/sampling.cpp             |  7 ++-
+ common/speculative.cpp          | 82 ++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-backend.cpp       | 25 +++++++++-
+ ggml/src/ggml-cuda/ggml-cuda.cu |  8 ++++
+ include/llama-nvtx.h            | 25 ++++++++++
+ src/CMakeLists.txt              |  8 ++++
+ src/llama-context.cpp           | 16 ++++++-
+ tools/server/CMakeLists.txt     | 12 +++++
+ tools/server/server-context.cpp |  4 ++
+ 10 files changed, 190 insertions(+), 5 deletions(-)
+ create mode 100644 include/llama-nvtx.h
+
+diff --git a/common/CMakeLists.txt b/common/CMakeLists.txt
+index 2b307c59d..ddf10e972 100644
+--- a/common/CMakeLists.txt
++++ b/common/CMakeLists.txt
+@@ -184,3 +184,11 @@ if (LLAMA_LLGUIDANCE)
+ endif()
+ 
+ target_link_libraries(${TARGET} PUBLIC llama Threads::Threads)
++
++if (GGML_CUDA)
++    find_package(CUDAToolkit QUIET)
++    if (CUDAToolkit_FOUND)
++        target_include_directories(${TARGET} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
++        target_compile_definitions(${TARGET} PRIVATE LLAMA_NVTX)
++    endif()
++endif()
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 9e16693fb..c8eaf55d2 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -1,4 +1,5 @@
+ #include "sampling.h"
++#include "llama-nvtx.h"
+ 
+ #include "common.h"
+ #include "fit.h"
+@@ -603,7 +604,11 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
+ }
+ 
+ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+-    llama_synchronize(ctx);
++    {
++        LLAMA_NVTX_RANGE("sample-sync");
++        llama_synchronize(ctx);
++    }
++    LLAMA_NVTX_RANGE("sample");
+ 
+     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
+     const auto tm = gsmpl->tm();
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 33165bfdb..61e5139ee 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1,4 +1,5 @@
+ #include "speculative.h"
++#include "llama-nvtx.h"
+ 
+ #include "common.h"
+ #include "ggml.h"
+@@ -1698,6 +1699,69 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+     };
+ 
++    // LLAMA_SPEC_PMIN_AUTO=1: the threshold of the confidence stop chosen online from the measured tokens per ms
++    struct pmin_auto {
++        bool enabled = false;
++        static constexpr int NA = 5;
++        float arm[NA]  = { 0.35f, 0.5f, 0.65f, 0.8f, 0.9f };
++        float rate[NA] = { 0, 0, 0, 0, 0 };   // tokens per ms, EMA (0 = not tried)
++        int   cur = 2;
++        int   explore_every = 8;
++        float a = 0.25f;
++        int64_t t_prev_us = 0;
++        int   warm = 0;      // rounds of the initial round-robin of this request
++        int   n_warm = 3;    // each arm this many times first
++        int   last_acc = -1;
++        uint64_t rounds = 0;
++        uint64_t played[NA] = {};
++        void init() {
++            enabled = getenv("LLAMA_SPEC_PMIN_AUTO") && atoi(getenv("LLAMA_SPEC_PMIN_AUTO")) != 0;
++            if (const char * e = getenv("LLAMA_SPEC_PMIN_EXPLORE")) explore_every = std::max(2, atoi(e));
++        }
++        float threshold() const { return arm[cur]; }
++        // a round begins: score the last one, pick the arm of this one
++        void begin_round() {
++            const int64_t now = ggml_time_us();
++            if (t_prev_us > 0 && last_acc >= 0) {
++                const float ms = (now - t_prev_us)/1000.0f;
++                if (ms > 2.0f && ms < 150.0f) {
++                    const float r = (last_acc + 1)/ms;
++                    rate[cur] = rate[cur] > 0 ? (1.0f - a)*rate[cur] + a*r : r;
++                }
++            }
++            t_prev_us = now;
++            last_acc  = -1;
++            int best = cur;
++            for (int k = 0; k < NA; ++k) {
++                if (rate[k] > rate[best]) best = k;
++            }
++            rounds++;
++            if (warm < NA*n_warm) {
++                // the initial round-robin of a request: every threshold measured on this text
++                cur = warm % NA;
++                warm++;
++            } else if (rounds % explore_every == 0) {
++                // a neighbour of the best arm, alternating sides; untried arms first
++                int nb = -1;
++                for (int k = 0; k < NA; ++k) if (rate[k] == 0) { nb = k; break; }
++                if (nb < 0) nb = ((rounds / explore_every) % 2) ? std::min(best + 1, NA - 1) : std::max(best - 1, 0);
++                cur = nb;
++            } else {
++                cur = best;
++            }
++            played[cur]++;
++            if (rounds % 400 == 0) {
++                LOG_WRN("pmin auto: rounds %llu, arm rates %.3f %.3f %.3f %.3f %.3f tok/ms, best %.2f\n", (unsigned long long) rounds,
++                        rate[0], rate[1], rate[2], rate[3], rate[4], arm[best]);
++            }
++        }
++        // a new request: what pays depends on the text, so the arms are measured again
++        void reset_request() {
++            t_prev_us = 0; last_acc = -1; warm = 0;
++            for (int k = 0; k < NA; ++k) rate[k] = 0.0f;
++        }
++    };
++
+     struct depth_ctl {
+         bool enabled = false;
+         int  cap = 3;
+@@ -1867,6 +1931,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<std::vector<float>> ev_last_p;   // calibrated-input probabilities of the last draft, per seq
+     std::vector<float> ev_P, ev_E;                // running chain acceptance and expected accepted, per seq
+     stop_rule sr;
++    pmin_auto pa;
+     std::vector<float> sr_P, sr_minlg, sr_lastp, sr_lastlm;   // per seq: chain acceptance, weakest draft, last draft p / margin
+     std::vector<int>   sr_n;                                   // per seq: drafts in the last round
+ 
+@@ -1909,6 +1974,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             if (const char * e = getenv("LLAMA_SPEC_STOP_LAM")) sr.lam = (float) atof(e);
+             if (const char * e = getenv("LLAMA_SPEC_STOP_LAM_A")) sr.lam_a = (float) atof(e);
+             if (const char * e = getenv("LLAMA_SPEC_STOP_ONLINE")) sr.online = atoi(e) != 0;
++        pa.init();
++        if (pa.enabled) {
++            LOG_INF("%s: confidence stop with an online threshold (LLAMA_SPEC_PMIN_AUTO)\n", __func__);
++        }
+             if (const char * e = getenv("LLAMA_SPEC_STOP_EXPLORE")) sr.explore_every = std::max(0, atoi(e));
+             sr.reset_request();
+             LOG_INF("%s: draft stop rule on (cap %d, min %d)\n", __func__, sr.cap, sr.dmin);
+@@ -2030,6 +2099,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (sr.enabled) {
+             sr.reset_request();
+         }
++        pa.reset_request();
+ 
+         // LLAMA_SPEC_DEPTH_RESET=1: the depth controller starts from its priors for every request
+         if (dctl.enabled && getenv("LLAMA_SPEC_DEPTH_RESET") && atoi(getenv("LLAMA_SPEC_DEPTH_RESET")) != 0) {
+@@ -2227,6 +2297,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
++        if (pa.enabled) {
++            pa.begin_round();
++        }
+         if (sr.enabled) {
+             const int64_t now = ggml_time_us();
+             if (sr.t_prev_us > 0 && sr.last_acc >= 0 && !sr.first_round) {
+@@ -2464,8 +2537,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 // add drafted token for each sequence
+                 const llama_token id = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+ 
+-                // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
++                // only collect very high-confidence draft tokens (LLAMA_SPEC_PMIN_AUTO: the online threshold)
++                if (cur_p->data[0].p < (pa.enabled ? pa.threshold() : params.p_min)) {
+                     drafting[seq_id] = false;
+                     n_drafting--;
+ 
+@@ -2648,6 +2721,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (dctl.enabled) {
+             dctl.last_acc = n_accepted;
+         }
++        if (pa.enabled) {
++            pa.last_acc = n_accepted;
++        }
+         if (sr.enabled) {
+             const int n = sr_n[seq_id];
+             const int tried = std::min<int>(n, n_accepted + 1);
+@@ -3775,6 +3851,7 @@ bool common_speculative_process(common_speculative * spec, const common_batch &
+ }
+ 
+ void common_speculative_draft(common_speculative * spec) {
++    LLAMA_NVTX_RANGE("spec-draft");
+     if (spec == nullptr) {
+         return;
+     }
+@@ -3865,6 +3942,7 @@ void common_speculative_draft(common_speculative * spec) {
+ }
+ 
+ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
++    LLAMA_NVTX_RANGE("spec-accept", (int) n_accepted);
+     common_speculative_impl * impl = spec->impl_last[seq_id];
+ 
+     if (impl == nullptr) {
+diff --git a/ggml/src/ggml-backend.cpp b/ggml/src/ggml-backend.cpp
+index 686a42699..08896b384 100644
+--- a/ggml/src/ggml-backend.cpp
++++ b/ggml/src/ggml-backend.cpp
+@@ -1813,8 +1813,31 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
+     ggml_backend_t split_backend = sched->backends[split_backend_id];
+     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
+     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
++    {
++        // fork: GGML_SCHED_LOG_COPIES=N logs the first N input copies of the splits (name, size, kind)
++        static int log_left = getenv("GGML_SCHED_LOG_COPIES") ? atoi(getenv("GGML_SCHED_LOG_COPIES")) : 0;
++        if (log_left > 0) {
++            log_left--;
++            fprintf(stderr, "sched-copy: %s %s %zu B flags %d from %s (host %d) to %s, op %s\n", input->name, ggml_type_name(input->type), ggml_nbytes(input),
++                    input->flags, input_backend ? ggml_backend_name(input_backend) : "-", input->buffer ? (int) ggml_backend_buffer_is_host(input->buffer) : -1,
++                    ggml_backend_name(split_backend), ggml_op_name(input->op));
++        }
++    }
+ 
+-    if (input->flags & GGML_TENSOR_FLAG_INPUT) {
++    // fork: a view of a user input (e.g. a reshape) holds user data too
++    const struct ggml_tensor * input_root = input;
++    while (input_root->view_src) {
++        input_root = input_root->view_src;
++    }
++    if ((input->flags & GGML_TENSOR_FLAG_INPUT) || (input_root->flags & GGML_TENSOR_FLAG_INPUT)) {
++        // fork: host inputs to a backend with asynchronous set: copy in stream order without waiting (the user, llama, synchronizes the
++        // scheduler before it writes the inputs again). GGML_SCHED_ASYNC_INPUTS=0: the synchronous copies below.
++        static const bool async_inputs = !getenv("GGML_SCHED_ASYNC_INPUTS") || atoi(getenv("GGML_SCHED_ASYNC_INPUTS")) != 0;
++        if (async_inputs && split_backend->iface.set_tensor_async && input->buffer && ggml_backend_buffer_is_host(input->buffer) &&
++            input_cpy->buffer && !ggml_backend_buffer_is_host(input_cpy->buffer) && ggml_is_contiguous(input) && sched->n_copies == 1) {
++            ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
++            return;
++        }
+         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
+         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8e98cb32e..e073348ad 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2796,6 +2796,11 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
+ #endif // CUDART_VERSION >= 12000
+ 
+     if (stat == cudaErrorGraphExecUpdateFailure) {
++        if (getenv("GGML_CUDA_GRAPH_STATS")) {
++#if CUDART_VERSION >= 12000
++            { cudaGraphNodeType nt = cudaGraphNodeTypeEmpty; if (result_info.errorNode) cudaGraphNodeGetType(result_info.errorNode, &nt); GGML_LOG_WARN("%s: CUDA graph update failed (result %d, node type %d), instantiating again\n", __func__, (int) result_info.result, (int) nt); if (nt == cudaGraphNodeTypeMemcpy) { cudaMemcpy3DParms mp = {}; cudaGraphMemcpyNodeGetParams(result_info.errorNode, &mp); GGML_LOG_WARN("   memcpy node: kind %d src %p dst %p extent %zu x %zu x %zu\n", (int) mp.kind, mp.srcPtr.ptr, mp.dstPtr.ptr, mp.extent.width, mp.extent.height, mp.extent.depth); } }
++#endif
++        }
+ #ifndef NDEBUG
+         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
+ #endif
+@@ -4864,6 +4869,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+     if (use_cuda_graph) {
+         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+         if (graph->instance == nullptr) { // Create executable graph from captured graph.
++            if (getenv("GGML_CUDA_GRAPH_STATS")) {
++                GGML_LOG_WARN("%s: new CUDA graph instance for key %p (%zu graphs kept)\n", __func__, graph_key, cuda_ctx->cuda_graphs.size());
++            }
+             CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+         }
+         if (cuda_graph_update_required) { // Update graph executable
+diff --git a/include/llama-nvtx.h b/include/llama-nvtx.h
+new file mode 100644
+index 000000000..e8f8f6d73
+--- /dev/null
++++ b/include/llama-nvtx.h
+@@ -0,0 +1,25 @@
++#pragma once
++// fork: NVTX ranges for Nsight Systems (LLAMA_NVTX is defined by the build when the CUDA toolkit is found)
++#if defined(LLAMA_NVTX) && defined(__has_include)
++#if __has_include(<nvtx3/nvToolsExt.h>)
++#if defined(_WIN32) && !defined(NOMINMAX)
++#define NOMINMAX
++#endif
++#include <nvtx3/nvToolsExt.h>
++#ifdef small
++#undef small
++#endif
++#include <cstdio>
++struct llama_nvtx_range {
++    explicit llama_nvtx_range(const char * name) { nvtxRangePushA(name); }
++    llama_nvtx_range(const char * name, int n) { char b[64]; snprintf(b, sizeof(b), "%s %d", name, n); nvtxRangePushA(b); }
++    ~llama_nvtx_range() { nvtxRangePop(); }
++};
++#define LLAMA_NVTX_CAT2(a, b) a##b
++#define LLAMA_NVTX_CAT(a, b) LLAMA_NVTX_CAT2(a, b)
++#define LLAMA_NVTX_RANGE(...) llama_nvtx_range LLAMA_NVTX_CAT(llama_nvtx_r_, __LINE__)(__VA_ARGS__)
++#endif
++#endif
++#ifndef LLAMA_NVTX_RANGE
++#define LLAMA_NVTX_RANGE(...) do {} while (0)
++#endif
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 97250c2e8..c38a6f2f2 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -76,3 +76,11 @@ if (BUILD_SHARED_LIBS)
+     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
+     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
+ endif()
++
++if (GGML_CUDA)
++    find_package(CUDAToolkit QUIET)
++    if (CUDAToolkit_FOUND)
++        target_include_directories(llama PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
++        target_compile_definitions(llama PRIVATE LLAMA_NVTX)
++    endif()
++endif()
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 6c27fb573..63ea33620 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-nvtx.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -1433,6 +1434,7 @@ static void llama_host_mark(const char * what, int n) {
+ 
+ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+     llama_host_mark("pu-start", (int) ubatch.n_tokens);
++    LLAMA_NVTX_RANGE("ubatch", (int) ubatch.n_tokens);
+     if (mctx && !mctx->apply()) {
+         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+         ret = GGML_STATUS_FAILED;
+@@ -1466,6 +1468,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+ 
+         const auto t_start_us = ggml_time_us();
++        LLAMA_NVTX_RANGE("build+alloc");
+ 
+         gf = model.build_graph(gparams);
+         const auto t_built_us = ggml_time_us();
+@@ -1503,13 +1506,21 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
+ 
+         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+         llama_host_mark("graph-ready", (int) ubatch.n_tokens);
++        LLAMA_NVTX_RANGE("set_inputs");
++        // the scheduler copies the inputs asynchronously (GGML_SCHED_ASYNC_INPUTS): the copies of the last compute must be done
++        // before the host data is written again
++        ggml_backend_sched_synchronize(sched.get());
+         res->set_inputs(&ubatch);
+         llama_host_mark("inputs-set", (int) ubatch.n_tokens);
+ 
+         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+     }
+ 
+-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    ggml_status status;
++    {
++        LLAMA_NVTX_RANGE("compute");
++        status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
++    }
+     if (status != GGML_STATUS_SUCCESS) {
+         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+         ret = status;
+@@ -1762,6 +1773,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+ 
+ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     llama_host_mark("decode-start", -1);
++    LLAMA_NVTX_RANGE(model.hparams.n_layer() <= 4 ? "decode-dft" : "decode-tgt");
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -2029,6 +2041,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
+         //}
+ 
++        LLAMA_NVTX_RANGE("outputs");
+         auto * t_logits  = res->get_logits();
+         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
+         auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn()  : nullptr;
+@@ -4394,6 +4407,7 @@ bool llama_memory_seq_rm(
+     if (!mem) {
+         return true;
+     }
++    LLAMA_NVTX_RANGE("seq_rm");
+ 
+     return mem->seq_rm(seq_id, p0, p1);
+ }
+diff --git a/tools/server/CMakeLists.txt b/tools/server/CMakeLists.txt
+index 70b8d7da8..fad3c239d 100644
+--- a/tools/server/CMakeLists.txt
++++ b/tools/server/CMakeLists.txt
+@@ -67,3 +67,15 @@ install(TARGETS ${TARGET} RUNTIME)
+ 
+ target_link_libraries(${TARGET} PRIVATE llama-server-impl)
+ target_compile_features(${TARGET} PRIVATE cxx_std_17)
++
++if (GGML_CUDA)
++    find_package(CUDAToolkit QUIET)
++    if (CUDAToolkit_FOUND)
++        foreach(t llama-server server-context)
++            if (TARGET ${t})
++                target_include_directories(${t} PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
++                target_compile_definitions(${t} PRIVATE LLAMA_NVTX)
++            endif()
++        endforeach()
++    endif()
++endif()
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 9a9c0c90d..e8f0fb234 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1,4 +1,5 @@
+ #include "server-context.h"
++#include "llama-nvtx.h"
+ #include "server-chat.h"
+ #include "server-common.h"
+ #include "server-decision.h"
+@@ -3435,6 +3436,7 @@ private:
+ 
+                 if (use_ckpt_tgt) {
+                     //const int64_t t_start = ggml_time_us();
++                    LLAMA_NVTX_RANGE("ckpt-save-tgt");
+ 
+                     ckpt.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+ 
+@@ -4411,6 +4413,7 @@ private:
+                 // drafters that fill no distribution fall back here
+                 const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+ 
++                LLAMA_NVTX_RANGE("verify-accept");
+                 std::vector<llama_token> accepted;
+                 if (!synth_probs.empty()) {
+                     // synthetic acceptance replaces verification entirely, so it comes first
+@@ -4449,6 +4452,7 @@ private:
+ 
+                         SLT_DBG(slot, "restoring speculative checkpoint (pos_min = %d, pos_max = %d, size = %zu)\n", ckpt.pos_min, ckpt.pos_max, ckpt.size());
+ 
++                        LLAMA_NVTX_RANGE("ckpt-restore");
+                         GGML_ASSERT(ckpt.load_tgt(slot.ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY));
+ 
+                         if (slot.ctx_dft) {
+-- 
+2.56.0.windows.2
+

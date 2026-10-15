@@ -1,0 +1,190 @@
+From b483cae891f93d613d0bafa2359a015126ab9e84 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Thu, 15 Oct 2026 19:51:05 +0900
+Subject: [PATCH 1/2] HC combine: weights 2*sigmoid(inject/hc) inside
+ DSV4_HC_POST (ggml_dsv4_hc_post_sig, LLAMA_HC_POST_SIG=0 off); CPU help:
+ adaptive admission budget (LLAMA_MOE_CPU_ADMIT_PCIE)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ggml/include/ggml.h           |  9 +++++++++
+ ggml/src/ggml-cpu/ops.cpp     |  5 ++++-
+ ggml/src/ggml-cuda/dsv4-hc.cu | 14 +++++++++++---
+ ggml/src/ggml.c               | 15 +++++++++++++++
+ src/llama-moe-cache.cpp       | 19 ++++++++++++++++++-
+ src/models/qwen4exp.cpp       |  9 +++++++++
+ 6 files changed, 66 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index db133a55b..ab914be91 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2826,6 +2826,15 @@ extern "C" {
+             struct ggml_tensor  * post,
+             struct ggml_tensor  * comb);
+ 
++    // fork: hc_post with the weights from the raw injection, post = out_scale * sigmoid(inject * in_scale), identity comb
++    GGML_API struct ggml_tensor * ggml_dsv4_hc_post_sig(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * x,
++            struct ggml_tensor  * residual,
++            struct ggml_tensor  * inject,
++            float                 in_scale,
++            float                 out_scale);
++
+     // custom operators
+ 
+     typedef void (*ggml_custom1_op_t)(struct ggml_tensor * dst , const struct ggml_tensor * a, int ith, int nth, void * userdata);
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 1f89688a4..6af993065 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -11680,7 +11680,10 @@ static void ggml_compute_forward_dsv4_hc_post_f32(
+         const int64_t it     = ir / (n_embd * hc);
+ 
+         const float xv = *(const float *) ((const char *) x->data    + i0*nbx0 + it*nbx1);
+-        const float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
++        float pv = *(const float *) ((const char *) post->data + idst*nbp0 + it*nbp1);
++        if (ggml_get_op_params_i32(dst, 0)) {
++            pv = ggml_get_op_params_f32(dst, 2) / (1.0f + expf(-pv*ggml_get_op_params_f32(dst, 1)));
++        }
+ 
+         float sum = xv * pv;
+         if (comb) {
+diff --git a/ggml/src/ggml-cuda/dsv4-hc.cu b/ggml/src/ggml-cuda/dsv4-hc.cu
+index ca1d2dc8a..3e94514fb 100644
+--- a/ggml/src/ggml-cuda/dsv4-hc.cu
++++ b/ggml/src/ggml-cuda/dsv4-hc.cu
+@@ -167,7 +167,10 @@ static __global__ void dsv4_hc_post_f32(
+         int64_t sc2,
+         int64_t sd0,
+         int64_t sd1,
+-        int64_t sd2) {
++        int64_t sd2,
++        int     sig,
++        float   in_scale,
++        float   out_scale) {
+     ggml_cuda_pdl_lc();
+     const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+     const int64_t nr = n_embd * hc * n_tokens;
+@@ -182,7 +185,11 @@ static __global__ void dsv4_hc_post_f32(
+     const int64_t idst = (ir / n_embd) % hc;
+     const int64_t it   = ir / (n_embd * hc);
+ 
+-    float sum = x[i0*sx0 + it*sx1] * post[idst*sp0 + it*sp1];
++    float pv = post[idst*sp0 + it*sp1];
++    if (sig) {
++        pv = out_scale / (1.0f + expf(-pv*in_scale));
++    }
++    float sum = x[i0*sx0 + it*sx1] * pv;
+     if constexpr (has_comb) {
+         for (int64_t isrc = 0; isrc < hc; ++isrc) {
+             sum += residual[i0*sr0 + isrc*sr1 + it*sr2] * comb[idst*sc0 + isrc*sc1 + it*sc2];
+@@ -312,5 +319,6 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
+             nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
+             nbp0 / sizeof(float), nbp1 / sizeof(float),
+             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+-            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
++            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
++            ggml_get_op_params_i32(dst, 0), ggml_get_op_params_f32(dst, 1), ggml_get_op_params_f32(dst, 2));
+ }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index e1fc24abc..634c1af3d 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6729,6 +6729,21 @@ struct ggml_tensor * ggml_dsv4_hc_post(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_dsv4_hc_post_sig(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * x,
++        struct ggml_tensor  * residual,
++        struct ggml_tensor  * inject,
++        float                 in_scale,
++        float                 out_scale) {
++    struct ggml_tensor * result = ggml_dsv4_hc_post(ctx, x, residual, inject, NULL);
++    const int32_t flag = 1;
++    ggml_set_op_params_i32(result, 0, flag);
++    ggml_set_op_params_f32(result, 1, in_scale);
++    ggml_set_op_params_f32(result, 2, out_scale);
++    return result;
++}
++
+ ////////////////////////////////////////////////////////////////////////////////
+ 
+ struct ggml_hash_set ggml_hash_set_new(size_t size) {
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index d0d18e863..1385e667c 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -1074,6 +1074,10 @@ struct llama_moe_cache::impl {
+ 
+     // admission of the CPU-computed misses by DMA (second stream)
+     int32_t adm_max = 64;
++    // adaptive admission (LLAMA_MOE_CPU_ADMIT_PCIE = experts' worth of PCIe per forward, default 0 = off): the admissions of a forward
++    // are capped at that budget minus the misses the GPU copied in the last forward, so they use the link when the copies leave it idle
++    int32_t adm_pcie = 0;
++    int32_t adm_cap  = 64;
+     ggml_backend_t       adm_backend = nullptr;
+     ggml_backend_event_t adm_event   = nullptr;
+     struct adm_entry { int32_t ig, il, e, s; };
+@@ -1175,6 +1179,10 @@ struct llama_moe_cache::impl {
+         if (getenv("LLAMA_MOE_CPU_ADMIT")) {
+             adm_max = std::max(0, atoi(getenv("LLAMA_MOE_CPU_ADMIT")));
+         }
++        if (getenv("LLAMA_MOE_CPU_ADMIT_PCIE")) {
++            adm_pcie = std::max(0, atoi(getenv("LLAMA_MOE_CPU_ADMIT_PCIE")));
++        }
++        adm_cap = adm_max;
+         adm_lock.resize(groups.size());
+         for (size_t ig = 0; ig < groups.size(); ++ig) {
+             adm_lock[ig].assign(groups[ig].lru.n_slots, 0);
+@@ -1353,7 +1361,7 @@ struct llama_moe_cache::impl {
+                 const int32_t v = row[o_tr + 2*t + 1];
+                 if (v & (1 << 28)) {
+                     f_cpu++;
+-                    if (adm_max > 0 && (int32_t) adm_want.size() < adm_max && e >= 0 && e < NE) {
++                    if (adm_max > 0 && (int32_t) adm_want.size() < adm_cap && e >= 0 && e < NE) {
+                         adm_want.emplace_back((int32_t) il, e);
+                     }
+                     continue;
+@@ -1428,6 +1436,15 @@ struct llama_moe_cache::impl {
+             pl[0] = n;
+         }
+ 
++        // the admission budget of the next forward from this forward's GPU copies
++        if (read && adm_pcie > 0) {
++            int32_t copies = 0;
++            for (int32_t m : miss_g) {
++                copies += m;
++            }
++            adm_cap = std::min(adm_max, std::max(0, adm_pcie - copies));
++        }
++
+         // 2b. admission of the CPU misses of the last forward: each gets the least recently used slot that is not in a pool, the copy
+         //     runs by DMA on the second stream while the next forward computes; the slot is mapped at the next begin_forward
+         if (read && !adm_want.empty()) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index a1db7046c..3d414aec4 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -391,6 +391,15 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_combine(
+     const int64_t hc = hparams.dsv4_hc_mult;
+     const int64_t nt = residual->ne[2];
+ 
++    // fork: the weights 2*sigmoid(inject/hc) computed inside the combine (three tiny ops fewer per mixer)
++    static const bool fused_w = !getenv("LLAMA_HC_POST_SIG") || atoi(getenv("LLAMA_HC_POST_SIG")) != 0;
++    if (fused_w && cparams.fused_dsv4_hc_post && il >= 0) {
++        ggml_tensor * cur = ggml_dsv4_hc_post_sig(ctx0, block_out, residual, inject, 1.0f / (float) hc, 2.0f);
++        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_POST, cur, il});
++        cb(cur, "hc_combine", il);
++        return cur;
++    }
++
+     // 2*sigmoid centres the scatter weights on 1, so a zero injection is a plain residual add
+     ggml_tensor * w = ggml_sigmoid(ctx0, ggml_scale(ctx0, inject, 1.0f / (float) hc));
+     w = ggml_scale(ctx0, w, 2.0f);
+-- 
+2.56.0.windows.2
+

@@ -1,0 +1,73 @@
+From a2dd622a9b50ac1b749bd6f933a2457e21e29381 Mon Sep 17 00:00:00 2001
+From: mac125b <mac125b@example.invalid>
+Date: Wed, 14 Oct 2026 23:53:57 +0900
+Subject: [PATCH] native Windows: portable host clock (ggml_time_us), MTP
+ adapter off without dlfcn, GGML_CUDA_REGISTER_HOST via _putenv_s
+
+---
+ common/speculative.cpp  | 6 ++++++
+ src/llama-context.cpp   | 4 +++-
+ src/llama-moe-cache.cpp | 4 ++++
+ 3 files changed, 13 insertions(+), 1 deletion(-)
+
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 0f12a8a51..ec781f359 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1388,7 +1388,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
+ };
+ 
+ 
++#ifndef _WIN32
+ #include <dlfcn.h>
++#endif
+ // recursion adapter for chained MTP draft steps (LLAMA_SPEC_MTP_ADAPTER)
+ struct mtp_adapter {
+     int ne = 0, r = 0, n_streams = 4;
+@@ -1412,8 +1414,12 @@ struct mtp_adapter {
+             ok = ok && fread(U.data(), 4, U.size(), f) == U.size() && fread(V.data(), 4, V.size(), f) == V.size();
+         }
+         fclose(f);
++#ifndef _WIN32
+         void * h = dlopen("/System/Library/Frameworks/Accelerate.framework/Accelerate", RTLD_LAZY);
+         sgemv = h ? (sgemv_t) dlsym(h, "cblas_sgemv") : nullptr;
++#else
++        sgemv = nullptr; // the adapter uses Accelerate (macOS only)
++#endif
+         xc.resize(ne); y.resize(ne); t.resize(std::max(r, 1));
+         return ok && sgemv;
+     }
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 8250abb50..6c27fb573 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -23,8 +23,10 @@
+ #include <unordered_map>
+ #include <time.h>
+ static double llama_host_mark_ms() {
+-#ifdef __APPLE__
++#if defined(__APPLE__)
+     return clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1e6;
++#elif defined(_WIN32)
++    return ggml_time_us()/1e3;
+ #else
+     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec*1e3 + ts.tv_nsec/1e6;
+ #endif
+diff --git a/src/llama-moe-cache.cpp b/src/llama-moe-cache.cpp
+index 3189c4c08..922dd1bf8 100644
+--- a/src/llama-moe-cache.cpp
++++ b/src/llama-moe-cache.cpp
+@@ -810,6 +810,10 @@ struct llama_moe_cache::impl {
+             }
+ #ifndef _WIN32
+             setenv("GGML_CUDA_REGISTER_HOST", "1", 0);
++#else
++            if (!getenv("GGML_CUDA_REGISTER_HOST")) {
++                _putenv_s("GGML_CUDA_REGISTER_HOST", "1");
++            }
+ #endif
+             // the address ranges of the experts of the layers this device caches, merged and page aligned
+             std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
+-- 
+2.56.0.windows.2
+
