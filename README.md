@@ -149,12 +149,14 @@ Outputs are identical to the unmodified build at the same draft depth. Prompt pr
 
 ## Windows (native) + RTX 4090 edition (2026-10-15)
 
-The same model and file on the same gaming PC, now as a **native Windows build** (no WSL), tuned for realistic single-user speed on
+Model measured: **Qwen3.8-Flash-Next 125B**, ISTA-DASLab GSQ-RCO **IQ3_XXS** GGUF (2 shards, 47 GB; the same file in both rows),
+with its own MTP draft head (Q8_0 for the baseline; experts re-quantized to Q4_K / Q5_0 for this work, which does not change the output).
+The same gaming PC as the WSL edition, now as a **native Windows build** (no WSL), tuned for realistic single-user speed on
 that machine: the GPU-side MoE cache lookup of the WSL edition, a fused hyper-connection mix (`GGML_OP_HC_MIX`), graphs kept per
 small-batch shape, and asynchronous copies of the per-forward inputs (found with Nsight Systems: about 30 synchronous copies per
 forward kept the GPU waiting). Details, caveats, build and run steps: [`windows/README.md`](windows/README.md) (Japanese).
 
-| (native Windows, RTX 4090, fixed metric, mean of 2 runs) | bench 1K | bench 4K | code 400 | prose 400 | mean | CPU | VRAM |
+| (Qwen3.8-Flash-Next 125B IQ3_XXS, native Windows, RTX 4090, fixed metric, mean of 2 runs) | bench 1K | bench 4K | code 400 | prose 400 | mean | CPU | VRAM |
 |---|---:|---:|---:|---:|---:|---:|---:|
 | llama.cpp 781dbc5, unmodified, expert cache 14 GB, MTP Q8_0 depth 3 | 115.7 | 116.8 | 67.6 | 68.5 | 92.1 | 9 % | 23.4 GB |
 | **this work** (`windows/patches`, cache 14.6 GB, small MTP depth 3) | **151.8** | **149.4** | **97.9** | **93.4** | **123.1** | 12 % | 23.2 GB |

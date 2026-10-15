@@ -31,6 +31,13 @@ One machine tested; see the caveats below.*
 
 ## 結果(この PC、固定指標)
 
+**測定したモデル(両方の行で同じファイル)**
+
+| | |
+|---|---|
+| 本体 | **Qwen3.8-Flash-Next 125B**(MoE、エキスパート 512 個から上位 10 個、1 トークンあたり 約 6B が動作)の ISTA-DASLab GSQ-RCO **IQ3_XXS** GGUF、2 分割、約 47 GB(`Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-0000{1,2}-of-00002.gguf`) |
+| 下書き(MTP) | 同モデルの MTP ヘッド。比較元は Q8_0 のまま(`mtp-Qwen3.8-Flash-Next-Q8_0.gguf`)、本作はエキスパートだけ Q4_K / Q5_0 にした版(`mtp-Qwen3.8-Flash-Next-Q8e4.gguf`、`tools/make-mtp-q4.bat` で作成。下書きは本体が必ず検証するので出力は変わりません) |
+
 計測は moe-on-a-desk と同じ固定指標です(`tools/abw.py`):思考なし、MTP(モデル自身の下書きヘッド)あり、llama-server の timings の
 デコード tok/s。bench = 1K / 4K トークンのプロンプトに 256 トークンの応答を 3 回(`mac125b/tools/measure/` のベンチ)、
 コード・文章 = 固定のプロンプト 1 つずつに greedy で 400 トークン。CPU は全 32 スレッドに対する平均使用率、VRAM は GPU 全体の
